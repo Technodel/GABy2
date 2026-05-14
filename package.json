@@ -1,44 +1,24 @@
 {
-  "name": "gaby",
-  "version": "1.0.0",
-  "description": "GABy — Your Personal AI Coding Sidekick",
+  "name": "gaby-renderer",
   "private": true,
+  "version": "1.0.0",
+  "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.json && npm run build:renderer",
-    "build:renderer": "cd src/renderer && npm run build",
-    "start": "node dist/server/index.js",
-    "dev": "concurrently \"npm run dev:server\" \"npm run dev:renderer\"",
-    "dev:server": "ts-node-dev --respawn --transpile-only src/server/index.ts",
-    "dev:renderer": "cd src/renderer && npm run dev",
-    "install:all": "npm install && cd src/renderer && npm install && cd ../../bridge && npm install"
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.96.0",
-    "bcryptjs": "^2.4.3",
-    "better-sqlite3": "^12.10.0",
-    "cookie-parser": "^1.4.6",
-    "cors": "^2.8.5",
-    "dotenv": "^17.4.2",
-    "express": "^4.18.2",
-    "express-rate-limit": "^7.1.5",
-    "jsonwebtoken": "^9.0.2",
-    "mathjs": "^12.4.1",
-    "uuid": "^9.0.0",
-    "ws": "^8.16.0",
-    "zod": "^3.22.4"
+    "lucide-react": "^0.344.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.22.1"
   },
   "devDependencies": {
-    "@types/bcryptjs": "^2.4.6",
-    "@types/better-sqlite3": "^7.6.8",
-    "@types/cookie-parser": "^1.4.7",
-    "@types/cors": "^2.8.17",
-    "@types/express": "^4.17.21",
-    "@types/jsonwebtoken": "^9.0.5",
-    "@types/node": "^20.10.0",
-    "@types/uuid": "^9.0.7",
-    "@types/ws": "^8.5.10",
-    "concurrently": "^8.2.2",
-    "ts-node-dev": "^2.0.0",
-    "typescript": "^5.3.2"
+    "@types/react": "^18.2.55",
+    "@types/react-dom": "^18.2.19",
+    "@vitejs/plugin-react": "^4.2.1",
+    "typescript": "^5.3.3",
+    "vite": "^5.1.4"
   }
 }
