@@ -1,0 +1,234 @@
+/**
+ * SUNy Code Conscience — Blueprint Memory Layer
+ *
+ * Persistently stores design decisions, architectural intent, and session
+ * outcomes so that every turn compounds knowledge rather than starting fresh.
+ *
+ * Two capabilities:
+ *   1. POST-TURN EXTRACTION — after the agent loop completes, this module
+ *      analyzes what happened (what files changed, what intent drove the
+ *      changes, what the outcome was) and writes a concise blueprint entry.
+ *   2. PRE-TURN INJECTION — before the agent loop starts, relevant prior
+ *      blueprint entries are injected into the system prompt so the AI
+ *      operates with full memory of past design decisions.
+ */
+
+import { getDb } from './db';
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+export interface BlueprintEntry {
+  id: number;
+  user_id: number;
+  project_id: number | null;
+  session_id: string | null;
+  turn_index: number;
+  category: BlueprintCategory;
+  summary: string;
+  details: string | null;
+  intent: string | null;
+  affected_files: string | null; // JSON array of file paths
+  created_at: string;
+}
+
+export type BlueprintCategory =
+  | 'design_decision'
+  | 'architecture_change'
+  | 'bug_fix'
+  | 'refactor'
+  | 'feature_add'
+  | 'dependency_change'
+  | 'config_change'
+  | 'test_strategy'
+  | 'user_preference'
+  | 'goal_completed';
+
+// ── Category heuristics ───────────────────────────────────────────────────────
+
+function classifyCategory(summary: string, changedFiles: string[], userMessage: string): BlueprintCategory {
+  const t = `${summary} ${userMessage}`.toLowerCase();
+  if (/\b(fix|bug|error|crash|broken|regression|issue)\b/.test(t)) return 'bug_fix';
+  if (/\b(refactor(ed|ing)?|clean|restructure|rename|extract|reorganize)\b/.test(t)) return 'refactor';
+  if (/\b(feature|add|new|implement|create|introduce)\b/.test(t)) return 'feature_add';
+  if (/\b(depend|package|npm|pip|gem|cargo|install|upgrade|downgrade)\b/.test(t)) return 'dependency_change';
+  if (/\b(config|setting|setup|environment|env)\b/.test(t)) return 'config_change';
+  if (/\b(architect|design|pattern|structur|layout|plan)\b/.test(t)) return 'architecture_change';
+  if (/\b(test|spec|jest|mocha|vitest|coverage)\b/.test(t)) return 'test_strategy';
+  if (/\b(prefer|like|want|style|format|theme|dark|mode)\b/.test(t)) return 'user_preference';
+  if (/\b(done|complete|finish|achieved|goal|accomplish)\b/.test(t)) return 'goal_completed';
+  return 'design_decision';
+}
+
+// ── Extract intent from user message ──────────────────────────────────────────
+
+function extractIntent(userMessage: string): string {
+  // Use the first sentence or question as the core intent
+  const cleaned = userMessage
+    .replace(/^(i want|i need|please|can you|could you|would you)\s+/i, '')
+    .replace(/[.!?].*$/, '')
+    .trim();
+  return cleaned.length > 200 ? cleaned.slice(0, 200) : cleaned;
+}
+
+// ── Store a blueprint entry ───────────────────────────────────────────────────
+
+export function storeBlueprintEntry(entry: {
+  userId: number;
+  projectId: number | null;
+  sessionId: string;
+  turnIndex: number;
+  summary: string;
+  details?: string;
+  intent?: string;
+  affectedFiles?: string[];
+}): BlueprintEntry {
+  const db = getDb();
+  const category = classifyCategory(entry.summary, entry.affectedFiles ?? [], entry.intent ?? '');
+  const intent = entry.intent ?? extractIntent(entry.summary);
+  const filesJson = entry.affectedFiles?.length ? JSON.stringify(entry.affectedFiles) : null;
+
+  const result = db.prepare(`
+    INSERT INTO blueprint_entries (user_id, project_id, session_id, turn_index, category, summary, details, intent, affected_files)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    entry.userId,
+    entry.projectId,
+    entry.sessionId,
+    entry.turnIndex,
+    category,
+    entry.summary.slice(0, 500),
+    entry.details?.slice(0, 2000) ?? null,
+    intent.slice(0, 300),
+    filesJson,
+  );
+
+  return {
+    id: result.lastInsertRowid as number,
+    user_id: entry.userId,
+    project_id: entry.projectId,
+    session_id: entry.sessionId,
+    turn_index: entry.turnIndex,
+    category,
+    summary: entry.summary.slice(0, 500),
+    details: entry.details?.slice(0, 2000) ?? null,
+    intent: intent.slice(0, 300),
+    affected_files: filesJson,
+    created_at: new Date().toISOString(),
+  };
+}
+
+// ── Query blueprint entries ───────────────────────────────────────────────────
+
+export function getBlueprintEntries(options: {
+  userId: number;
+  projectId?: number;
+  limit?: number;
+  categories?: BlueprintCategory[];
+}): BlueprintEntry[] {
+  const db = getDb();
+  const conditions: string[] = ['user_id = ?'];
+  const params: unknown[] = [options.userId];
+
+  if (options.projectId !== undefined) {
+    conditions.push('project_id = ?');
+    params.push(options.projectId);
+  }
+
+  if (options.categories?.length) {
+    conditions.push(`category IN (${options.categories.map(() => '?').join(',')})`);
+    params.push(...options.categories);
+  }
+
+  const sql = `
+    SELECT * FROM blueprint_entries
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY created_at DESC, turn_index DESC
+    LIMIT ?
+  `;
+  params.push(options.limit ?? 20);
+
+  return db.prepare(sql).all(...params) as BlueprintEntry[];
+}
+
+// ── Get compact context string for system prompt injection ────────────────────
+
+/**
+ * Returns a plain-text context block of recent blueprint entries for the given
+ * user/project. Designed to be injected into the system prompt before each turn.
+ *
+ * The output is intentionally concise — 3-5 most recent entries with category
+ * labels, summaries, and intents. This keeps token overhead low while giving
+ * the AI full design memory continuity.
+ */
+export function getBlueprintContext(options: {
+  userId: number;
+  projectId?: number;
+  maxEntries?: number;
+}): string {
+  const entries = getBlueprintEntries({
+    userId: options.userId,
+    projectId: options.projectId,
+    limit: options.maxEntries ?? 5,
+  });
+
+  if (entries.length === 0) return '';
+
+  const sections = entries.map((e, i) => {
+    const tag = e.category.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    const files = e.affected_files
+      ? (JSON.parse(e.affected_files) as string[]).slice(0, 4).join(', ')
+      : '';
+    return (
+      `[${i + 1}] ${tag}\n` +
+      `    Intent: ${e.intent}\n` +
+      `    Summary: ${e.summary}\n` +
+      (files ? `    Files: ${files}\n` : '')
+    );
+  }).join('\n');
+
+  return (
+    '\n\n=== SUNy CODE CONSCIENCE — DESIGN MEMORY ===\n' +
+    'The following entries record past design decisions and outcomes from this project.\n' +
+    'Use them to maintain consistency with prior intent.\n\n' +
+    sections +
+    '\n=== END DESIGN MEMORY ==='
+  );
+}
+
+// ── Aggregate summaries (lightweight knowledge flywheel) ──────────────────────
+
+/**
+ * Returns a high-level "design trajectory" summary — the categories of decisions
+ * made and how many entries each has. Gives the AI a sense of thematic focus.
+ */
+export function getBlueprintSummary(options: {
+  userId: number;
+  projectId?: number;
+}): string {
+  const db = getDb();
+  const conditions: string[] = ['user_id = ?'];
+  const params: unknown[] = [options.userId];
+
+  if (options.projectId !== undefined) {
+    conditions.push('project_id = ?');
+    params.push(options.projectId);
+  }
+
+  const rows = db.prepare(`
+    SELECT category, COUNT(*) as count
+    FROM blueprint_entries
+    WHERE ${conditions.join(' AND ')}
+    GROUP BY category
+    ORDER BY count DESC
+  `).all(...params) as { category: string; count: number }[];
+
+  if (rows.length === 0) return '';
+
+  const total = rows.reduce((s, r) => s + r.count, 0);
+  const lines = rows.map(r => {
+    const label = r.category.replace(/_/g, ' ');
+    return `  ${label}: ${r.count}`;
+  }).join('\n');
+
+  return `\n[Blueprint memory contains ${total} entries — project design knowledge:\n${lines}]`;
+}

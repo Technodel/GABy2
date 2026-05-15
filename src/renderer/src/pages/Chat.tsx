@@ -1,0 +1,3122 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { Send, Plus, Trash2, Settings, LogOut, Square, Eraser, Book, Edit3, RotateCcw, Copy, Check, Pencil, MessageSquare, FileText, X, BarChart2, User, HelpCircle, Folder, FolderOpen, Play, ChevronRight, ChevronDown, Sparkles, Home, Phone } from 'lucide-react';
+import BalanceBadge from '../components/BalanceBadge';
+import BridgeStatusBadge from '../components/BridgeStatusBadge';
+import ModeSelector from '../components/ModeSelector';
+import NarratedMessage, { ThinkingIndicator } from '../components/NarratedMessage';
+import ReportBadgeButton, { ReportMetrics } from '../components/ReportBadgeButton';
+import { useWebSocket } from '../hooks/useWebSocket';
+import { useNavigate } from 'react-router-dom';
+
+// ── Bridge install instructions ────────────────────────────────────────────────
+function BridgeInstallInstructions({ autoCopy = false }: { autoCopy?: boolean }) {
+  const [cmd, setCmd] = useState('');
+  const [copied, setCopied] = useState(false);
+  const isWindows = navigator.userAgent.includes('Windows');
+
+  useEffect(() => {
+    fetch('/api/bridge-token', { credentials: 'include' })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (!data?.token) return;
+        const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        const serverUrl = import.meta.env.DEV ? 'ws://localhost:3500' : `${wsProto}://${window.location.host}`;
+        const tgzUrl = `${window.location.protocol}//${window.location.host}/bridge/suny-bridge.tgz`;
+        const c = `npm install -g ${tgzUrl} && suny-bridge start --token ${data.token} --server ${serverUrl}`;
+        setCmd(c);
+        // Auto-copy as soon as command is ready
+        if (autoCopy) {
+          navigator.clipboard.writeText(c).then(() => { setCopied(true); setTimeout(() => setCopied(false), 3000); }).catch(() => {});
+        }
+      });
+  }, [autoCopy]);
+
+  function copy() {
+    if (!cmd) return;
+    navigator.clipboard.writeText(cmd).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000); });
+  }
+
+  return (
+    <div>
+      {/* Step guide */}
+      <div style={{ display: 'flex', gap: 0, marginBottom: 10 }}>
+        {[
+          { n: '1', label: copied ? '✓ Copied!' : 'Copy command', done: copied },
+          { n: '2', label: `Open ${isWindows ? 'PowerShell / CMD' : 'Terminal'}`, done: false },
+          { n: '3', label: 'Paste & press Enter', done: false },
+        ].map((s, i) => (
+          <div key={i} style={{ flex: 1, textAlign: 'center', fontSize: 11, color: s.done ? 'var(--success)' : 'var(--text-muted)' }}>
+            <div style={{
+              width: 22, height: 22, borderRadius: '50%', margin: '0 auto 4px',
+              background: s.done ? 'var(--success)' : 'var(--surface)',
+              border: `1px solid ${s.done ? 'var(--success)' : 'var(--border)'}`,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 10, fontWeight: 700, color: s.done ? '#fff' : 'var(--text-muted)',
+            }}>{s.done ? '✓' : s.n}</div>
+            {s.label}
+          </div>
+        ))}
+      </div>
+
+      {/* Command box */}
+      <div style={{ position: 'relative', background: 'var(--bg)', border: `1px solid ${copied ? 'var(--success)' : 'var(--border)'}`, borderRadius: 'var(--radius)', padding: '10px 44px 10px 12px', fontFamily: 'monospace', fontSize: 11, color: 'var(--text-primary)', wordBreak: 'break-all', lineHeight: 1.6, transition: 'border-color 0.2s' }}>
+        {cmd || 'Loading...'}
+        {cmd && (
+          <button
+            onClick={copy}
+            style={{ position: 'absolute', top: 8, right: 8, background: copied ? 'var(--success)' : 'var(--surface)', border: '1px solid var(--border)', borderRadius: 4, cursor: 'pointer', color: copied ? '#fff' : 'var(--text-muted)', padding: '3px 6px', fontSize: 11, display: 'flex', alignItems: 'center', gap: 4 }}
+            title="Copy command"
+          >
+            {copied ? <><Check size={12} /> Copied!</> : <><Copy size={12} /> Copy</>}
+          </button>
+        )}
+      </div>
+
+      {autoCopy && cmd && (
+        <p style={{ fontSize: 11, color: copied ? 'var(--success)' : 'var(--text-muted)', marginTop: 6, transition: 'color 0.3s' }}>
+          {copied ? '✓ Command copied to clipboard — now open a terminal and paste.' : 'Click Copy above, then paste in your terminal.'}
+        </p>
+      )}
+    </div>
+  );
+}
+
+interface Project {
+  id: number;
+  name: string;
+  local_path: string;
+  persona?: string | null;
+}
+
+interface ProjectSpend {
+  project_id: number;
+  name: string;
+  total_tokens: number;
+  total_cost: number;
+}
+
+interface Mode {
+  mode: string;
+  display_name: string;
+  session_limit_label: string;
+}
+
+interface UserData {
+  id: number;
+  username: string;
+  balance: number;
+  wallet_balance: number;
+  wallet_auto_spend: boolean;
+  selected_mode: string;
+  max_tokens_per_session?: number | null;
+  cross_device_memory_enabled?: boolean;
+  chat_show_technical_details?: boolean;
+  bridge_connected: boolean;
+  modes: Mode[];
+}
+
+interface Message {
+  type: 'user' | 'suny' | 'system';
+  content: string;
+  id: number;
+  timestamp: number;
+  report?: ReportMetrics;
+}
+
+interface Memory {
+  id: string;
+  projectId: number;
+  title: string;
+  summary: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+interface ProofRun {
+  id: number;
+  startedAt: number;
+  finishedAt?: number;
+  status: 'running' | 'completed' | 'failed';
+  toolCalls: string[];
+  checks: string[];
+  durationMs?: number;
+  toolCallCount?: number;
+  filesChanged?: number;
+  steps?: number;
+}
+
+interface ChatProps {
+  onLogout: () => void;
+  onOpenSettings: (section?: 'general' | 'wallet', notice?: string) => void;
+  onBridgeOffline: () => void;
+}
+
+// ── File browser tree node ──────────────────────────────────────────────────
+interface FileNode { name: string; path: string; isDir: boolean; children?: FileNode[]; }
+
+function FileTreeNode({ node, expandedDirs, onToggle, onFileClick }: {
+  node: FileNode;
+  expandedDirs: Set<string>;
+  onToggle: (path: string) => void;
+  onFileClick: (node: FileNode) => void;
+}) {
+  const expanded = expandedDirs.has(node.path);
+  return (
+    <div>
+      <div
+        onClick={() => node.isDir ? onToggle(node.path) : onFileClick(node)}
+        style={{
+          padding: '3px 12px 3px 12px',
+          cursor: 'pointer',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 5,
+          color: node.isDir ? 'var(--text)' : 'var(--text-muted)',
+          fontSize: 11,
+        }}
+        onMouseEnter={e => (e.currentTarget.style.background = 'var(--hover)')}
+        onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+      >
+        {node.isDir
+          ? (expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />)
+          : <span style={{ width: 10 }} />}
+        {node.isDir
+          ? (expanded ? <FolderOpen size={11} style={{ color: 'var(--accent)' }} /> : <Folder size={11} style={{ color: 'var(--accent)' }} />)
+          : <FileText size={10} />}
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{node.name}</span>
+      </div>
+      {node.isDir && expanded && node.children && (
+        <div style={{ paddingLeft: 12 }}>
+          {node.children.map(child => (
+            <FileTreeNode key={child.path} node={child} expandedDirs={expandedDirs} onToggle={onToggle} onFileClick={onFileClick} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: ChatProps) {
+  const navigate = useNavigate();
+  const [userData, setUserData] = useState<UserData | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectSpend, setProjectSpend] = useState<Record<number, ProjectSpend>>({});
+  const [activeProject, setActiveProject] = useState<Project | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState('');
+  const [thinking, setThinking] = useState(false);
+  const [streamingContent, setStreamingContent] = useState('');
+  const streamingContentRef = useRef('');
+  const [thinkingStatus, setThinkingStatus] = useState('');
+  const [bridgeConnected, setBridgeConnected] = useState(false);
+  const [showBridgeTip, setShowBridgeTip] = useState(false);
+  const [crossDeviceMemoryEnabled, setCrossDeviceMemoryEnabled] = useState(false);
+  const [showTechnicalDetails, setShowTechnicalDetails] = useState(false);
+  const [projectStateReady, setProjectStateReady] = useState(false);
+  const [globalIntroLine, setGlobalIntroLine] = useState('');
+
+  // ── Talk / Write mode ────────────────────────────────────────────────────────
+  const [talkMode, setTalkMode] = useState<boolean>(() => {
+    try { return localStorage.getItem('suny_talk_mode') === '1'; } catch { return false; }
+  });
+  function toggleTalkMode() {
+    setTalkMode(prev => {
+      const next = !prev;
+      try { localStorage.setItem('suny_talk_mode', next ? '1' : '0'); } catch {}
+      return next;
+    });
+  }
+
+  // ── Adaptive routing ─────────────────────────────────────────────────────
+  const [routingReason, setRoutingReason] = useState<string | null>(null);
+  const [resolvedMode, setResolvedMode] = useState<string>('fast');
+
+  function routingIcon(mode: string): string {
+    const icons: Record<string, string> = {
+      'free': '💰',
+      'fast': '⚡',
+      'smart': '🚀',
+      'pro': '⭐',
+    };
+    return icons[mode] ?? '⚙️';
+  }
+
+  function normalizeReport(report: unknown): ReportMetrics | undefined {
+    if (!report || typeof report !== 'object') return undefined;
+    const value = report as Partial<ReportMetrics>;
+    if (typeof value.durationMs !== 'number') return undefined;
+    const inputTokens = typeof value.inputTokens === 'number' ? value.inputTokens : 0;
+    const outputTokens = typeof value.outputTokens === 'number' ? value.outputTokens : 0;
+    const cacheWriteTokens = typeof value.cacheWriteTokens === 'number' ? value.cacheWriteTokens : 0;
+    const cacheReadTokens = typeof value.cacheReadTokens === 'number' ? value.cacheReadTokens : 0;
+    return {
+      durationMs: value.durationMs,
+      totalTokens: typeof value.totalTokens === 'number' ? value.totalTokens : inputTokens + outputTokens + cacheWriteTokens + cacheReadTokens,
+      inputTokens,
+      outputTokens,
+      cacheWriteTokens,
+      cacheReadTokens,
+      chargedCost: typeof value.chargedCost === 'number' ? value.chargedCost : 0,
+      humanEstimateMinutes: typeof value.humanEstimateMinutes === 'number' ? value.humanEstimateMinutes : 0,
+      humanEstimateCost: typeof value.humanEstimateCost === 'number' ? value.humanEstimateCost : 0,
+      messageCount: typeof value.messageCount === 'number' ? value.messageCount : undefined,
+    };
+  }
+
+  function normalizeMessage(raw: Partial<Message>, index: number): Message {
+    return {
+      id: typeof raw.id === 'number' ? raw.id : index + 1,
+      type: raw.type === 'user' ? 'user' : raw.type === 'suny' ? 'suny' : raw.type === 'system' ? 'system' : 'system',
+      content: typeof raw.content === 'string' ? raw.content : '',
+      timestamp: typeof raw.timestamp === 'number' ? raw.timestamp : Date.now() - ((index + 1) * 1000),
+      report: normalizeReport(raw.report),
+    };
+  }
+
+  // ── Sound effects ─────────────────────────────────────────────────────────
+  const soundsEnabled = (() => { try { return localStorage.getItem('suny_sounds_enabled') !== 'false'; } catch { return true; } })();
+
+  function playSound(type: 'send' | 'receive' | 'tool' | 'success' | 'error') {
+    if (!soundsEnabled) return;
+    try {
+      const ctx = new AudioContext();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      const now = ctx.currentTime;
+      osc.type = 'square';
+      switch (type) {
+        case 'send':
+          osc.frequency.setValueAtTime(880, now);
+          osc.frequency.exponentialRampToValueAtTime(1320, now + 0.06);
+          gain.gain.setValueAtTime(0.04, now);
+          gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+          osc.start(now); osc.stop(now + 0.12);
+          break;
+        case 'receive':
+          osc.frequency.setValueAtTime(440, now);
+          osc.frequency.linearRampToValueAtTime(660, now + 0.07);
+          osc.frequency.linearRampToValueAtTime(550, now + 0.14);
+          gain.gain.setValueAtTime(0.04, now);
+          gain.gain.exponentialRampToValueAtTime(0.001, now + 0.2);
+          osc.start(now); osc.stop(now + 0.2);
+          break;
+        case 'tool':
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(600, now);
+          osc.frequency.setValueAtTime(800, now + 0.05);
+          gain.gain.setValueAtTime(0.03, now);
+          gain.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
+          osc.start(now); osc.stop(now + 0.1);
+          break;
+        case 'success':
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(523, now);
+          osc.frequency.setValueAtTime(659, now + 0.08);
+          osc.frequency.setValueAtTime(784, now + 0.16);
+          gain.gain.setValueAtTime(0.05, now);
+          gain.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
+          osc.start(now); osc.stop(now + 0.28);
+          break;
+        case 'error':
+          osc.frequency.setValueAtTime(300, now);
+          osc.frequency.exponentialRampToValueAtTime(200, now + 0.15);
+          gain.gain.setValueAtTime(0.05, now);
+          gain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+          osc.start(now); osc.stop(now + 0.18);
+          break;
+      }
+      void ctx.close();
+    } catch { /* AudioContext may be unavailable */ }
+  }
+
+  // ── Project Rules (.suny-rules) ──────────────────────────────────────────────
+  const [projectRules, setProjectRules] = useState<string | null>(null);
+  const [showRulesEditor, setShowRulesEditor] = useState(false);
+  const [rulesEditorContent, setRulesEditorContent] = useState('');
+
+  async function loadProjectRules(projectId: number) {
+    try {
+      const res = await fetch(`/api/projects/${projectId}/rules`, { credentials: 'include' });
+      if (res.ok) {
+        const data = await res.json();
+        setProjectRules(data.rules);
+      }
+    } catch {}
+  }
+
+  async function saveProjectRulesApi(content: string) {
+    if (!activeProject) return;
+    const res = await fetch(`/api/projects/${activeProject.id}/rules`, {
+      method: 'PUT',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    });
+    if (res.ok) {
+      setProjectRules(content.trim() || null);
+      setShowRulesEditor(false);
+    }
+  }
+
+  // ── Persona per project ──────────────────────────────────────────
+  const [showPersonaEditor, setShowPersonaEditor] = useState(false);
+  const [personaEditorContent, setPersonaEditorContent] = useState('');
+
+  async function savePersonaApi(content: string) {
+    if (!activeProject) return;
+    const res = await fetch(`/api/projects/${activeProject.id}/persona`, {
+      method: 'PATCH',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ persona: content.trim() || null }),
+    });
+    if (res.ok) {
+      setProjects(ps => ps.map(p => p.id === activeProject.id ? { ...p, persona: content.trim() || null } : p));
+      setActiveProject(prev => prev ? { ...prev, persona: content.trim() || null } : prev);
+      setShowPersonaEditor(false);
+    }
+  }
+
+  // ── Usage stats ──────────────────────────────────────────────────────────
+  interface UsageDay { day: string; input_tokens: number; output_tokens: number; cache_read_tokens: number; charged_cost: number; }
+  interface UsageMode { mode: string; input_tokens: number; output_tokens: number; charged_cost: number; }
+  interface UsageTotals { input_tokens: number; output_tokens: number; cache_read_tokens: number; charged_cost: number; }
+  const [showUsage, setShowUsage] = useState(false);
+  const [usageByDay, setUsageByDay] = useState<UsageDay[]>([]);
+  const [usageByMode, setUsageByMode] = useState<UsageMode[]>([]);
+  const [usageTotals, setUsageTotals] = useState<UsageTotals | null>(null);
+  const [usageDays, setUsageDays] = useState(14);
+
+  async function loadUsageStats(days = usageDays) {
+    try {
+      const res = await fetch(`/api/me/usage?days=${days}`, { credentials: 'include' });
+      if (res.ok) {
+        const data = await res.json();
+        setUsageByDay(data.by_day ?? []);
+        setUsageByMode(data.by_mode ?? []);
+        setUsageTotals(data.totals ?? null);
+      }
+    } catch {}
+  }
+
+  // ── Checkpoints ──────────────────────────────────────────────────────────────
+  interface CheckpointEntry { sha: string; message: string; date: string; filesChanged?: number; }
+  const [checkpoints, setCheckpoints] = useState<CheckpointEntry[]>([]);
+  const [showCheckpoints, setShowCheckpoints] = useState(false);
+  const [rollingBack, setRollingBack] = useState<string | null>(null);
+  const [rollbackConfirm, setRollbackConfirm] = useState<string | null>(null);
+
+  async function loadCheckpoints(projectId: number) {
+    try {
+      const res = await fetch(`/api/projects/${projectId}/checkpoints`, { credentials: 'include' });
+      if (res.ok) {
+        const data = await res.json();
+        setCheckpoints(data.checkpoints ?? []);
+      }
+    } catch {}
+  }
+
+  async function rollbackToCheckpoint(sha: string) {
+    if (!activeProject) return;
+    setRollbackConfirm(null);
+    setRollingBack(sha);
+    try {
+      const res = await fetch(`/api/projects/${activeProject.id}/checkpoints/rollback`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sha }),
+      });
+      if (res.ok) {
+        await loadCheckpoints(activeProject.id);
+        addMessage('system', `✓ Rolled back to checkpoint \`${sha.slice(0, 7)}\`. Your project files have been restored to that state.`);
+      } else {
+        const data = await res.json().catch(() => ({}));
+        addMessage('system', `⚠️ Rollback failed: ${(data as { error?: string }).error ?? 'Unknown error'}`);
+      }
+    } finally {
+      setRollingBack(null);
+    }
+  }
+
+  // ── Blueprint Memory Graph ────────────────────────────────────────────────
+  interface BlueprintEntry {
+    id: number;
+    category: string;
+    summary: string;
+    intent: string | null;
+    affected_files: string | null;
+    created_at: string;
+  }
+  const [blueprintEntries, setBlueprintEntries] = useState<BlueprintEntry[]>([]);
+
+  async function loadBlueprintEntries(projectId: number) {
+    try {
+      const res = await fetch(`/api/projects/${projectId}/blueprint`, { credentials: 'include' });
+      if (res.ok) {
+        const data = await res.json();
+        setBlueprintEntries(data.entries ?? []);
+      }
+    } catch {}
+  }
+
+  function blueprintCategoryLabel(cat: string): string {
+    return cat.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  }
+
+  function blueprintCategoryColor(cat: string): string {
+    const map: Record<string, string> = {
+      bug_fix: 'var(--error)',
+      feature_add: 'var(--success)',
+      architecture_change: 'var(--accent)',
+      refactor: 'var(--warning)',
+      design_decision: 'var(--text-muted)',
+      dependency_change: '#e8912d',
+      config_change: '#888',
+      test_strategy: '#6cc',
+      user_preference: '#c8a',
+      goal_completed: 'var(--success)',
+    };
+    return map[cat] ?? 'var(--text-muted)';
+  }
+
+  // ── End Blueprint Memory Graph ──────────────────────────────────────────
+  const thinkingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastResponseEvent = useRef(Date.now());
+
+  function clearThinkingTimeout() {
+    if (thinkingTimeoutRef.current) {
+      clearTimeout(thinkingTimeoutRef.current);
+      thinkingTimeoutRef.current = null;
+    }
+  }
+
+  function resetThinkingTimeout() {
+    clearThinkingTimeout();
+    lastResponseEvent.current = Date.now();
+    thinkingTimeoutRef.current = setTimeout(() => {
+      // No response for 90s — cancel and notify
+      setThinking(false);
+      setStreamingContent('');
+      addMessage('system', "SUNy seems to be taking longer than expected. Try sending your message again — I'll take it from here! 💪");
+    }, 90000);
+  }
+  const [balance, setBalance] = useState(0);
+  const [walletBalance, setWalletBalance] = useState(0);
+  const [selectedMode, setSelectedMode] = useState('fast');
+  const [showNewProject, setShowNewProject] = useState(false);
+  const [newProjectName, setNewProjectName] = useState('');
+  const [newProjectPath, setNewProjectPath] = useState('');
+  const [newProjectPathError, setNewProjectPathError] = useState('');
+
+  // ── Create-from-scratch mode ─────────────────────────────────────────────
+  const [newProjectMode, setNewProjectMode] = useState<'link' | 'scratch'>('link');
+  const [scratchDescription, setScratchDescription] = useState('');
+
+  // ── Onboarding ───────────────────────────────────────────────────────────
+  const [showOnboarding, setShowOnboarding] = useState<boolean>(() => {
+    try { return localStorage.getItem('suny_onboarded') !== '1'; } catch { return true; }
+  });
+  function dismissOnboarding() {
+    try { localStorage.setItem('suny_onboarded', '1'); } catch {}
+    setShowOnboarding(false);
+  }
+
+  // ── File browser ─────────────────────────────────────────────────────────
+  interface FileNode { name: string; path: string; isDir: boolean; children?: FileNode[]; }
+  const [fileBrowser, setFileBrowser] = useState<FileNode[]>([]);
+  const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
+  const [showFileBrowser, setShowFileBrowser] = useState(false);
+
+  async function loadFileBrowser(projectId: number) {
+    try {
+      const res = await fetch(`/api/projects/${projectId}/files`, { credentials: 'include' });
+      if (res.ok) setFileBrowser(await res.json());
+    } catch {}
+  }
+
+  // ── Live server ───────────────────────────────────────────────────────────
+  const [devServerUrl, setDevServerUrl] = useState<string | null>(null);
+  const [devServerRunning, setDevServerRunning] = useState(false);
+  const [devServerLoading, setDevServerLoading] = useState(false);
+
+  async function startDevServer() {
+    if (!activeProject) return;
+    setDevServerLoading(true);
+    try {
+      const res = await fetch(`/api/projects/${activeProject.id}/dev-server/start`, {
+        method: 'POST', credentials: 'include',
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setDevServerUrl(data.url ?? null);
+        setDevServerRunning(true);
+      }
+    } finally { setDevServerLoading(false); }
+  }
+
+  async function stopDevServer() {
+    if (!activeProject) return;
+    setDevServerLoading(true);
+    try {
+      await fetch(`/api/projects/${activeProject.id}/dev-server/stop`, {
+        method: 'POST', credentials: 'include',
+      });
+      setDevServerRunning(false);
+      setDevServerUrl(null);
+    } finally { setDevServerLoading(false); }
+  }
+
+  // ── Bridge keyboard shortcut help ────────────────────────────────────────────
+  const [showHelp, setShowHelp] = useState(false);
+
+  const [terminalLaunching, setTerminalLaunching] = useState(false);
+  const [terminalLaunched, setTerminalLaunched] = useState(false);
+  const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({
+    projects: true,
+    memories: true,
+    rules: true,
+    persona: true,
+  });
+  const [confirmClearMemories, setConfirmClearMemories] = useState(false);
+
+  async function launchBridgeTerminal() {
+    setTerminalLaunching(true);
+    setTerminalLaunched(false);
+    try {
+      const res = await fetch('/api/bridge/launch-terminal', { method: 'POST', credentials: 'include' });
+      if (res.ok) {
+        setTerminalLaunched(true);
+        setTimeout(() => setTerminalLaunched(false), 4000);
+      } else {
+        // Remote server or no terminal — fall back to copy instructions already visible
+      }
+    } catch {
+      // ignore, copy instructions still visible
+    } finally {
+      setTerminalLaunching(false);
+    }
+  }
+  const lastNarrationRef = useRef('');
+  const msgEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const inputHistoryIndex = useRef(-1);
+  const sessionId = useRef('s_' + Date.now() + '_' + Math.random().toString(36).slice(2));
+  const [sessUsed, setSessUsed] = useState(0);
+  const [sessLimit, setSessLimit] = useState<number | null>(null);
+  let msgId = useRef(0);
+  const [proofRuns, setProofRuns] = useState<ProofRun[]>([]);
+  const activeProofIdRef = useRef<number | null>(null);
+  const [expandedRunIds, setExpandedRunIds] = useState<Set<number>>(new Set());
+
+  function nextId() { return ++msgId.current; }
+
+  // ── Proof run persistence ────────────────────────────────────────────────
+  const proofHistoryKey = `suny_proof_runs_${activeProject?.id ?? 'global'}`;
+
+  function saveProofRuns(runs: ProofRun[]) {
+    try { localStorage.setItem(proofHistoryKey, JSON.stringify(runs.slice(0, 20))); } catch {}
+  }
+
+  function copyProofReportToClipboard(run: ProofRun) {
+    const timeStr = new Date(run.startedAt).toLocaleString();
+    const durationMs = run.durationMs ?? ((run.finishedAt ?? Date.now()) - run.startedAt);
+    const durationSec = (durationMs / 1000).toFixed(1);
+    const statusEmoji = run.status === 'completed' ? '✅' : run.status === 'failed' ? '❌' : '🔄';
+    
+    let report = `${statusEmoji} SUNy Proof Report\n`;
+    report += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+    report += `Date: ${timeStr}\n`;
+    report += `Duration: ${durationSec}s\n`;
+    report += `Status: ${run.status.toUpperCase()}\n\n`;
+
+    if (run.toolCalls.length > 0) {
+      report += `Tools Used:\n`;
+      run.toolCalls.forEach(tool => {
+        report += `  • ${toolLabel(tool)}\n`;
+      });
+      report += `\n`;
+    }
+
+    if (run.checks.length > 0) {
+      report += `Checks Performed:\n`;
+      run.checks.forEach(check => {
+        report += `  ✓ ${check}\n`;
+      });
+      report += `\n`;
+    }
+
+    if (run.filesChanged) {
+      report += `Files Changed: ${run.filesChanged}\n`;
+    }
+    if (run.steps) {
+      report += `Steps: ${run.steps}\n`;
+    }
+
+    navigator.clipboard.writeText(report).then(
+      () => {
+        // Show toast or brief notification
+        addMessage('system', '✓ Proof report copied to clipboard!');
+      },
+      () => {
+        addMessage('system', '⚠️ Could not copy to clipboard');
+      }
+    );
+  }
+
+  function startProofRun() {
+    const run: ProofRun = {
+      id: Date.now(),
+      startedAt: Date.now(),
+      status: 'running',
+      toolCalls: [],
+      checks: [],
+    };
+    activeProofIdRef.current = run.id;
+    setProofRuns(prev => {
+      const updated = [run, ...prev].slice(0, 8);
+      saveProofRuns(updated);
+      return updated;
+    });
+  }
+
+  function updateActiveProof(updater: (run: ProofRun) => ProofRun) {
+    const activeId = activeProofIdRef.current;
+    if (!activeId) return;
+    setProofRuns(prev => {
+      const updated = prev.map(r => (r.id === activeId ? updater(r) : r));
+      saveProofRuns(updated);
+      return updated;
+    });
+  }
+
+  function pushToolToProof(toolName: string) {
+    updateActiveProof(run =>
+      run.toolCalls.includes(toolName)
+        ? run
+        : { ...run, toolCalls: [...run.toolCalls, toolName] },
+    );
+  }
+
+  function pushCheckToProof(message: string) {
+    updateActiveProof(run => ({ ...run, checks: [...run.checks, message].slice(-12) }));
+  }
+
+  function finishActiveProof(status: 'completed' | 'failed') {
+    const activeId = activeProofIdRef.current;
+    if (!activeId) return;
+    setProofRuns(prev => {
+      const updated = prev.map(r => (r.id === activeId ? { ...r, status, finishedAt: Date.now() } : r));
+      saveProofRuns(updated);
+      return updated;
+    });
+    activeProofIdRef.current = null;
+  }
+
+  function applyProofSummary(summary: Record<string, unknown>) {
+    const activeId = activeProofIdRef.current;
+    setProofRuns(prev => {
+      if (prev.length === 0) return prev;
+      const targetIndex = activeId ? prev.findIndex(r => r.id === activeId) : 0;
+      const i = targetIndex >= 0 ? targetIndex : 0;
+      const run = prev[i];
+      const toolCalls = Array.isArray(summary.toolCalls)
+        ? (summary.toolCalls as unknown[]).map(v => String(v))
+        : run.toolCalls;
+      const nextChecks = [...run.checks];
+      if (typeof summary.durationMs === 'number') nextChecks.push(`Duration ${Math.round((summary.durationMs as number) / 1000)}s`);
+      if (typeof summary.steps === 'number') nextChecks.push(`Steps ${(summary.steps as number)}`);
+      if (typeof summary.filesChanged === 'number') nextChecks.push(`Files changed ${(summary.filesChanged as number)}`);
+      const nextRun: ProofRun = {
+        ...run,
+        toolCalls,
+        toolCallCount: typeof summary.toolCallCount === 'number' ? (summary.toolCallCount as number) : run.toolCallCount,
+        durationMs: typeof summary.durationMs === 'number' ? (summary.durationMs as number) : run.durationMs,
+        filesChanged: typeof summary.filesChanged === 'number' ? (summary.filesChanged as number) : run.filesChanged,
+        steps: typeof summary.steps === 'number' ? (summary.steps as number) : run.steps,
+        checks: nextChecks.slice(-12),
+      };
+      const out = [...prev];
+      out[i] = nextRun;
+      saveProofRuns(out);
+      return out;
+    });
+  }
+
+  function toolLabel(name: string): string {
+    const labels: Record<string, string> = {
+      file_read: 'Read Files',
+      file_edit: 'Edit Files',
+      file_write: 'Write Files',
+      list_dir: 'List Folders',
+      search_code: 'Search Code',
+      bash: 'Run Command',
+      web_search: 'Web Search',
+    };
+    return labels[name] ?? name;
+  }
+
+  // ── Memory state ─────────────────────────────────────────────────────────────
+  const [memories, setMemories] = useState<Memory[]>([]);
+  const [editingMemory, setEditingMemory] = useState<Memory | null>(null);
+  const [editTitle, setEditTitle] = useState('');
+  const [editSummary, setEditSummary] = useState('');
+  const [recallingMemory, setRecallingMemory] = useState<Memory | null>(null);
+  const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function memoriesKey(projectId: number) { return `suny_memories_${projectId}`; }
+
+  function loadMemories(projectId: number): Memory[] {
+    try {
+      const raw = localStorage.getItem(memoriesKey(projectId));
+      if (!raw) return [];
+      return JSON.parse(raw) as Memory[];
+    } catch { return []; }
+  }
+
+  function saveMemories(projectId: number, ms: Memory[]) {
+    try { localStorage.setItem(memoriesKey(projectId), JSON.stringify(ms)); } catch {}
+  }
+
+  async function loadProjectStateFromServer(projectId: number): Promise<{ messages: Message[]; memories: Memory[] } | null> {
+    try {
+      const res = await fetch(`/api/projects/${projectId}/state`, { credentials: 'include' });
+      if (!res.ok) return null;
+      const data = await res.json() as { messages?: Message[]; memories?: Memory[] };
+      return {
+        messages: Array.isArray(data.messages) ? data.messages.slice(-200) : [],
+        memories: Array.isArray(data.memories) ? data.memories : [],
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async function syncProjectStateToServer(projectId: number, msgs: Message[], mems: Memory[]) {
+    try {
+      await fetch(`/api/projects/${projectId}/state`, {
+        method: 'PUT',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: msgs.slice(-200), memories: mems }),
+      });
+    } catch {
+      // best effort sync
+    }
+  }
+
+  async function openProject(project: Project) {
+    // Save current project's local cache before switching
+    if (activeProject && messages.length > 0) {
+      saveProjectMessages(activeProject.id, messages);
+    }
+    setActiveProject(project);
+    setDevServerRunning(false);
+    setDevServerUrl(null);
+    if (showFileBrowser) loadFileBrowser(project.id);
+  }
+
+  function addMemory(title: string, summary: string) {
+    if (!activeProject) return;
+    const mem: Memory = {
+      id: 'm_' + Date.now(),
+      projectId: activeProject.id,
+      title,
+      summary,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    const updated = [mem, ...memories];
+    setMemories(updated);
+    saveMemories(activeProject.id, updated);
+  }
+
+  function deleteMemory(id: string) {
+    if (!activeProject) return;
+    const updated = memories.filter(m => m.id !== id);
+    setMemories(updated);
+    saveMemories(activeProject.id, updated);
+  }
+
+  function updateMemory(id: string, title: string, summary: string) {
+    if (!activeProject) return;
+    const updated = memories.map(m =>
+      m.id === id ? { ...m, title, summary, updatedAt: Date.now() } : m
+    );
+    setMemories(updated);
+    saveMemories(activeProject.id, updated);
+  }
+
+  function recallMemory(mem: Memory) {
+    // Insert memory context as a system message, then start fresh
+    setMessages([{
+      type: 'system',
+      content: `📝 Recalled memory: "${mem.title}"\n${mem.summary}`,
+      id: nextId(),
+      timestamp: Date.now(),
+    }]);
+    setRecallingMemory(null);
+  }
+
+  // Load messages when project changes (or when no project is selected)
+  useEffect(() => {
+    let cancelled = false;
+    async function hydrateProjectState(projectId: number) {
+      setProjectStateReady(false);
+
+      const localMsgs = loadProjectMessages(projectId);
+      const localMems = loadMemories(projectId);
+
+      if (crossDeviceMemoryEnabled) {
+        const remote = await loadProjectStateFromServer(projectId);
+        if (cancelled) return;
+        if (remote) {
+          setMessages(remote.messages.length > 0 ? remote.messages : localMsgs);
+          setMemories(remote.memories.length > 0 ? remote.memories : localMems);
+        } else {
+          setMessages(localMsgs);
+          setMemories(localMems);
+        }
+      } else {
+        setMessages(localMsgs);
+        setMemories(localMems);
+      }
+
+      if (!cancelled) setProjectStateReady(true);
+    }
+
+    if (activeProject) {
+      hydrateProjectState(activeProject.id);
+      loadProjectRules(activeProject.id);
+      loadCheckpoints(activeProject.id);
+      loadBlueprintEntries(activeProject.id);
+    } else {
+      // Global chat (no project) - load from global storage
+      const globalMsgs = loadGlobalChat();
+      setMessages(globalMsgs);
+      setMemories([]);
+      setProjectRules(null);
+      setCheckpoints([]);
+      setProjectStateReady(true);
+    }
+
+    return () => { cancelled = true; };
+  }, [activeProject?.id, crossDeviceMemoryEnabled]);
+
+  // ── localStorage persistence ──────────────────────────────────────────────────
+  const globalChatKey = 'suny_chat_global';
+  function storageKey(projectId: number) { return `suny_chat_${projectId}`; }
+
+  // ── Multiple global chat tabs ─────────────────────────────────────────────
+  interface GlobalTab { id: string; name: string; }
+
+  const [globalTabs, setGlobalTabs] = useState<GlobalTab[]>(() => {
+    try {
+      const raw = localStorage.getItem('suny_global_tabs');
+      if (raw) return JSON.parse(raw) as GlobalTab[];
+    } catch {}
+    return [{ id: 'default', name: 'Chat 1' }];
+  });
+
+  const [activeTabId, setActiveTabId] = useState<string>(() => {
+    try { return localStorage.getItem('suny_active_tab') ?? 'default'; } catch { return 'default'; }
+  });
+
+  const [renamingTabId, setRenamingTabId] = useState<string | null>(null);
+  const [renamingTabValue, setRenamingTabValue] = useState('');
+
+  function globalTabKey(tabId: string) { return `suny_chat_global_${tabId}`; }
+
+  function saveGlobalTabs(tabs: GlobalTab[]) {
+    try { localStorage.setItem('suny_global_tabs', JSON.stringify(tabs)); } catch {}
+  }
+
+  function addGlobalTab() {
+    const newId = 'tab_' + Date.now();
+    const newName = `Chat ${globalTabs.length + 1}`;
+    const newTab = { id: newId, name: newName };
+    const updatedTabs = [...globalTabs, newTab];
+    setGlobalTabs(updatedTabs);
+    saveGlobalTabs(updatedTabs);
+    // Save current messages before switching
+    try { localStorage.setItem(globalTabKey(activeTabId), JSON.stringify(messages.slice(-200))); } catch {}
+    setActiveTabId(newId);
+    try { localStorage.setItem('suny_active_tab', newId); } catch {}
+    setMessages([]);
+  }
+
+  function closeGlobalTab(tabId: string) {
+    if (globalTabs.length <= 1) {
+      // Just clear the tab instead of closing
+      setMessages([]);
+      try { localStorage.removeItem(globalTabKey(tabId)); } catch {}
+      return;
+    }
+    const updatedTabs = globalTabs.filter(t => t.id !== tabId);
+    setGlobalTabs(updatedTabs);
+    saveGlobalTabs(updatedTabs);
+    try { localStorage.removeItem(globalTabKey(tabId)); } catch {}
+    if (activeTabId === tabId) {
+      const newActiveId = updatedTabs[0].id;
+      setActiveTabId(newActiveId);
+      try { localStorage.setItem('suny_active_tab', newActiveId); } catch {}
+      const msgs = (() => { try { const r = localStorage.getItem(globalTabKey(newActiveId)); return r ? (JSON.parse(r) as Message[]).slice(-200).map((m, idx) => normalizeMessage(m, idx)) : []; } catch { return []; } })();
+      setMessages(msgs);
+    }
+  }
+
+  function switchGlobalTab(tabId: string) {
+    if (tabId === activeTabId) return;
+    // Save current messages
+    try { localStorage.setItem(globalTabKey(activeTabId), JSON.stringify(messages.slice(-200))); } catch {}
+    setActiveTabId(tabId);
+    try { localStorage.setItem('suny_active_tab', tabId); } catch {}
+    const msgs = (() => { try { const r = localStorage.getItem(globalTabKey(tabId)); return r ? (JSON.parse(r) as Message[]).slice(-200).map((m, idx) => normalizeMessage(m, idx)) : []; } catch { return []; } })();
+    setMessages(msgs);
+  }
+
+  function loadProjectMessages(projectId: number): Message[] {
+    try {
+      const raw = localStorage.getItem(storageKey(projectId));
+      if (!raw) return [];
+      return (JSON.parse(raw) as Message[]).slice(-200).map((m, idx) => normalizeMessage(m, idx));
+    } catch { return []; }
+  }
+
+  function loadGlobalChat(): Message[] {
+    // Try the tab-based key first, fall back to legacy key for migration
+    try {
+      const tabKey = globalTabKey(activeTabId);
+      const raw = localStorage.getItem(tabKey);
+      if (raw) return (JSON.parse(raw) as Message[]).slice(-200).map((m, idx) => normalizeMessage(m, idx));
+      // Migrate from legacy key on first load for default tab
+      if (activeTabId === 'default') {
+        const legacyRaw = localStorage.getItem(globalChatKey);
+        if (legacyRaw) {
+          const msgs = (JSON.parse(legacyRaw) as Message[]).slice(-200).map((m, idx) => normalizeMessage(m, idx));
+          try { localStorage.setItem(tabKey, JSON.stringify(msgs)); } catch {}
+          return msgs;
+        }
+      }
+      return [];
+    } catch { return []; }
+  }
+
+  function saveProjectMessages(projectId: number, msgs: Message[]) {
+    try { localStorage.setItem(storageKey(projectId), JSON.stringify(msgs.slice(-200))); } catch {}
+  }
+
+  function saveGlobalChat(msgs: Message[]) {
+    try { localStorage.setItem(globalTabKey(activeTabId), JSON.stringify(msgs.slice(-200))); } catch {}
+  }
+
+  useEffect(() => {
+    if (!projectStateReady) return;
+    
+    if (activeProject) {
+      saveProjectMessages(activeProject.id, messages);
+      saveMemories(activeProject.id, memories);
+
+      if (!crossDeviceMemoryEnabled) return;
+      if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+      syncTimerRef.current = setTimeout(() => {
+        syncProjectStateToServer(activeProject.id, messages, memories);
+      }, 450);
+    } else {
+      // Global chat - save to global storage
+      saveGlobalChat(messages);
+    }
+  }, [messages, memories, activeProject?.id, projectStateReady, crossDeviceMemoryEnabled]);
+
+  const { send: wsSend } = useWebSocket({
+    onMessage: (msg) => {
+      if (msg.event === 'suny:narration') {
+        lastNarrationRef.current = msg.message as string;
+        if (thinking) {
+          // New iteration starting — wipe the previous iteration's streamed text so
+          // intermediate tool-call narration doesn't accumulate in the display bubble.
+          setStreamingContent('');
+          streamingContentRef.current = '';
+          // During active processing: show as status in the thinking indicator, not a chat bubble
+          setThinkingStatus(msg.message as string);
+        } else {
+          // Not thinking (error messages, cancel confirmations): add as permanent chat bubble
+          clearThinkingTimeout();
+          addMessage('suny', msg.message as string);
+        }
+      } else if (msg.event === 'suny:thinking') {
+        setThinking(true);
+        setThinkingStatus('');
+        setStreamingContent('');
+        if (!activeProofIdRef.current) startProofRun();
+        resetThinkingTimeout();
+      } else if (msg.event === 'suny:preparation_step') {
+        setThinkingStatus(msg.step as string);
+      } else if (msg.event === 'suny:done') {
+        clearThinkingTimeout();
+        setThinking(false);
+        setThinkingStatus('');
+        finishActiveProof('completed');
+        addMessage('suny', msg.message as string);
+      } else if (msg.event === 'suny:tool_call') {
+        const toolName = String(msg.tool ?? 'unknown_tool');
+        pushToolToProof(toolName);
+        playSound('tool');
+      } else if (msg.event === 'suny:stream_start') {
+        setThinking(true);
+        setThinkingStatus('');
+        setStreamingContent('');
+        if (!activeProofIdRef.current) startProofRun();
+        resetThinkingTimeout();
+      } else if (msg.event === 'suny:stream_chunk') {
+        lastResponseEvent.current = Date.now();
+        setStreamingContent(prev => {
+          const next = (prev === 'SUNy is thinking...' || prev === '') ? (msg.chunk as string) : prev + (msg.chunk as string);
+          streamingContentRef.current = next;
+          return next;
+        });
+      } else if (msg.event === 'suny:stream_end') {
+        clearThinkingTimeout();
+        setThinking(false);
+        setThinkingStatus('');
+        if (msg.routing_reason && typeof msg.routing_reason === 'string') {
+          setRoutingReason(msg.routing_reason);
+        }
+        if (msg.resolved_mode && typeof msg.resolved_mode === 'string') {
+          setResolvedMode(msg.resolved_mode);
+        }
+        if (msg.proof_summary && typeof msg.proof_summary === 'object') {
+          applyProofSummary(msg.proof_summary as Record<string, unknown>);
+        }
+        finishActiveProof('completed');
+        playSound('receive');
+        // Prefer server-provided final content; fall back to what was streamed live, then to last narration
+        const finalContent = (msg.content as string)?.trim() || streamingContentRef.current || lastNarrationRef.current;
+        if (finalContent) {
+          const rawReport = msg.turn_report as Record<string, unknown> | undefined;
+          const report = rawReport && typeof rawReport.durationMs === 'number'
+            ? {
+              durationMs: rawReport.durationMs as number,
+              totalTokens: typeof rawReport.totalTokens === 'number'
+                ? rawReport.totalTokens as number
+                : (typeof rawReport.inputTokens === 'number' ? rawReport.inputTokens as number : 0) + (typeof rawReport.outputTokens === 'number' ? rawReport.outputTokens as number : 0) + (typeof rawReport.cacheWriteTokens === 'number' ? rawReport.cacheWriteTokens as number : 0) + (typeof rawReport.cacheReadTokens === 'number' ? rawReport.cacheReadTokens as number : 0),
+              inputTokens: typeof rawReport.inputTokens === 'number' ? rawReport.inputTokens as number : 0,
+              outputTokens: typeof rawReport.outputTokens === 'number' ? rawReport.outputTokens as number : 0,
+              cacheWriteTokens: typeof rawReport.cacheWriteTokens === 'number' ? rawReport.cacheWriteTokens as number : 0,
+              cacheReadTokens: typeof rawReport.cacheReadTokens === 'number' ? rawReport.cacheReadTokens as number : 0,
+              chargedCost: typeof rawReport.chargedCost === 'number' ? rawReport.chargedCost as number : 0,
+              humanEstimateMinutes: typeof rawReport.humanEstimateMinutes === 'number' ? rawReport.humanEstimateMinutes as number : 0,
+              humanEstimateCost: typeof rawReport.humanEstimateCost === 'number' ? rawReport.humanEstimateCost as number : 0,
+              messageCount: 1,
+            } satisfies ReportMetrics
+            : undefined;
+          addMessage('suny', finalContent, { timestamp: Date.now(), report });
+        } else {
+          addMessage('system', "I finished processing but didn't receive a final reply text. Please send that again and I'll answer right away.");
+        }
+        lastNarrationRef.current = '';
+        setStreamingContent('');
+        streamingContentRef.current = '';
+        if (msg.sess_used !== undefined) setSessUsed(msg.sess_used as number);
+        if (msg.sess_limit !== undefined) setSessLimit(msg.sess_limit as number | null);
+        // Refresh checkpoints and blueprint after agent turn
+        if (activeProject) {
+          loadCheckpoints(activeProject.id);
+          loadBlueprintEntries(activeProject.id);
+        }
+        loadProjectSpend();
+      } else if (msg.event === 'suny:lint_running') {
+        pushCheckToProof('Lint check started');
+        setThinkingStatus('Checking for errors...');
+      } else if (msg.event === 'suny:lint_errors') {
+        pushCheckToProof(`Lint found ${msg.errorCount as number} error(s) on pass ${msg.attempt as number}`);
+        setThinkingStatus(`Found ${msg.errorCount as number} error(s) — fixing (pass ${msg.attempt as number})...`);
+      } else if (msg.event === 'suny:lint_passed') {
+        pushCheckToProof('Lint passed');
+        setThinkingStatus('All checks passed ✓');
+        playSound('success');
+      } else if (msg.event === 'suny:test_running') {
+        pushCheckToProof(
+          (msg.attempt as number) === 0
+            ? 'Tests started'
+            : `Tests re-run attempt ${(msg.attempt as number) + 1}`,
+        );
+        setThinkingStatus(
+          (msg.attempt as number) === 0
+            ? 'Running tests...'
+            : `Re-running tests (attempt ${(msg.attempt as number) + 1})...`,
+        );
+      } else if (msg.event === 'suny:test_errors') {
+        pushCheckToProof(`Tests found ${msg.failCount as number} failure(s) on attempt ${msg.attempt as number}`);
+        setThinkingStatus(`${msg.failCount as number} test(s) failing — fixing (attempt ${msg.attempt as number})...`);
+      } else if (msg.event === 'suny:test_passed') {
+        pushCheckToProof('Tests passed');
+        setThinkingStatus((msg.attempt as number) === 0 ? 'Tests passed ✓' : `All tests passing ✓ (fixed in ${msg.attempt as number} attempt(s))`);
+      } else if (msg.event === 'suny:test_gave_up') {
+        pushCheckToProof('Tests still failing after retries');
+        finishActiveProof('failed');
+        setThinkingStatus('');
+        addMessage('system', `⚠️ Tests still failing after multiple attempts. SUNy couldn't automatically fix all test failures.\n\n💡 **Tip:** Try asking SUNy to explain the failing tests, or check if your test setup requires any environment variables or mocked dependencies.`);
+      } else if (msg.event === 'suny:lint_gave_up') {
+        pushCheckToProof(`Lint still failing after retries (${msg.errorCount as number} error(s))`);
+        finishActiveProof('failed');
+        addMessage('system', `⚠️ ${msg.errorCount} lint error(s) remain after ${3} fix attempts using \`${msg.command}\`.\n\n💡 **Tip:** You can ask SUNy: *"Fix the remaining lint errors"* or run \`${msg.command}\` in your terminal to see the full output.`);
+      } else if (msg.event === 'suny:balance') {
+        setBalance(msg.balance as number);
+        if (msg.wallet_balance !== undefined) setWalletBalance(msg.wallet_balance as number);
+        if (msg.sess_used !== undefined) setSessUsed(msg.sess_used as number);
+        if (msg.sess_limit !== undefined) setSessLimit(msg.sess_limit as number | null);
+      } else if (msg.event === 'bridge:connected') {
+        clearThinkingTimeout();
+        setBridgeConnected(true);
+      }
+    },
+    onConnect: () => {
+      // Reset stale state on reconnect — avoids forever-spinning thinking indicator
+      clearThinkingTimeout();
+      setThinking(false);
+      setThinkingStatus('');
+      setStreamingContent('');
+      streamingContentRef.current = '';
+      activeProofIdRef.current = null;
+    },
+    onDisconnect: () => { setBridgeConnected(false); },
+  });
+
+  useEffect(() => { loadUserData(); loadProjects(); return () => clearThinkingTimeout(); }, []);
+  useEffect(() => { msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, thinking]);
+  useEffect(() => {
+    const lines = [
+      'Pick any project and I will jump in immediately.',
+      'Choose a project from the sidebar and we can build right away.',
+      'Ready when you are. Open a project and let us start shipping.',
+      'Select a project and tell me the goal. I will handle the heavy lifting.',
+      'Open one of your projects and I can start coding end-to-end.',
+    ];
+    const pick = () => setGlobalIntroLine(lines[Math.floor(Math.random() * lines.length)]);
+    pick();
+    const t = setInterval(pick, 12000);
+    return () => clearInterval(t);
+  }, []);
+
+  async function loadUserData() {
+    const res = await fetch('/api/me', { credentials: 'include' });
+    if (res.ok) {
+      const data: UserData = await res.json();
+      setUserData(data);
+      setBalance(data.balance);
+      setWalletBalance(data.wallet_balance);
+      setSelectedMode(data.selected_mode);
+      setBridgeConnected(data.bridge_connected);
+      setCrossDeviceMemoryEnabled(Boolean(data.cross_device_memory_enabled));
+      setShowTechnicalDetails(Boolean(data.chat_show_technical_details));
+      if (data.max_tokens_per_session != null) setSessLimit(data.max_tokens_per_session);
+    }
+  }
+
+  async function loadProjects() {
+    const res = await fetch('/api/projects', { credentials: 'include' });
+    if (res.ok) setProjects(await res.json());
+    await loadProjectSpend();
+  }
+
+  async function loadProjectSpend() {
+    try {
+      const res = await fetch('/api/projects/spend', { credentials: 'include' });
+      if (!res.ok) return;
+      const rows = await res.json() as ProjectSpend[];
+      const next: Record<number, ProjectSpend> = {};
+      for (const row of rows) next[row.project_id] = row;
+      setProjectSpend(next);
+    } catch {
+      // best effort only
+    }
+  }
+
+  function formatTokenCount(tokens: number): string {
+    if (!isFinite(tokens) || tokens <= 0) return '0';
+    if (tokens >= 1000000) return `${(tokens / 1000000).toFixed(1)}M`;
+    if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}k`;
+    return `${Math.round(tokens)}`;
+  }
+
+  function formatSpend(cost: number): string {
+    if (!isFinite(cost) || cost <= 0) return '$0.00';
+    if (cost < 0.01) return `$${cost.toFixed(4)}`;
+    return `$${cost.toFixed(cost < 1 ? 3 : 2)}`;
+  }
+
+  function addMessage(type: 'user' | 'suny' | 'system', content: string, meta?: { timestamp?: number; report?: ReportMetrics }) {
+    setMessages(ms => [...ms, {
+      type,
+      content,
+      id: nextId(),
+      timestamp: meta?.timestamp ?? Date.now(),
+      report: meta?.report,
+    }]);
+  }
+
+  function summarizeProjectMessages(projectId: number): ReportMetrics {
+    const sourceMessages = activeProject?.id === projectId ? messages : loadProjectMessages(projectId);
+    const reportMessages = sourceMessages.filter(m => m.type === 'suny' && m.report);
+    const fallbackSpend = projectSpend[projectId];
+
+    if (reportMessages.length === 0) {
+      return {
+        durationMs: 0,
+        totalTokens: fallbackSpend?.total_tokens ?? 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheWriteTokens: 0,
+        cacheReadTokens: 0,
+        chargedCost: fallbackSpend?.total_cost ?? 0,
+        humanEstimateMinutes: 0,
+        humanEstimateCost: 0,
+        messageCount: 0,
+      };
+    }
+
+    const totals = reportMessages.reduce((acc, msg) => {
+      const report = msg.report as ReportMetrics;
+      acc.durationMs += report.durationMs;
+      acc.totalTokens += report.totalTokens;
+      acc.inputTokens += report.inputTokens;
+      acc.outputTokens += report.outputTokens;
+      acc.cacheWriteTokens += report.cacheWriteTokens;
+      acc.cacheReadTokens += report.cacheReadTokens;
+      acc.chargedCost += report.chargedCost;
+      acc.humanEstimateMinutes += report.humanEstimateMinutes;
+      acc.humanEstimateCost += report.humanEstimateCost;
+      return acc;
+    }, {
+      durationMs: 0,
+      totalTokens: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheWriteTokens: 0,
+      cacheReadTokens: 0,
+      chargedCost: 0,
+      humanEstimateMinutes: 0,
+      humanEstimateCost: 0,
+    });
+
+    return {
+      ...totals,
+      messageCount: reportMessages.length,
+    };
+  }
+
+  async function sendPreparedMessage(text: string, opts?: { forceWriteMode?: boolean; projectIdOverride?: number }) {
+    const cleaned = text.trim();
+    if (!cleaned) return;
+
+    const looksLikeExecutionTask = /(create|scaffold|build|generate|edit|fix|implement|run|install|start|delete|rename|refactor|file|folder|project)/i.test(cleaned);
+    let effectiveTalkMode = opts?.forceWriteMode ? false : talkMode;
+    let effectiveMode = selectedMode;
+    const effectiveProjectId = opts?.projectIdOverride ?? activeProject?.id;
+    const noCredits = balance <= 0 && walletBalance <= 0;
+
+    if (talkMode && opts?.forceWriteMode) {
+      addMessage('system', 'Switched this action to Write Mode automatically so SUNy can execute your scaffold request immediately.');
+    } else if (effectiveTalkMode && looksLikeExecutionTask) {
+      addMessage('system', 'Talk Mode is ON, so I will explain steps but not execute file or shell actions. Switch to Write Mode (pencil icon) to let SUNy perform the task.');
+    }
+
+    if (noCredits) {
+      effectiveMode = 'free';
+      effectiveTalkMode = true;
+      if (looksLikeExecutionTask) {
+        addMessage('system', 'Credits are empty, so SUNy is staying in free talk mode. It can explain the steps, but it will not run file or shell actions until you top up.');
+      }
+    }
+
+    if (effectiveProjectId && !bridgeConnected && looksLikeExecutionTask) {
+      addMessage('system', 'Bridge is offline, so SUNy cannot create files or run commands right now. Reconnect the bridge to execute this task end-to-end.');
+    }
+
+    setInput('');
+    inputHistoryIndex.current = -1;
+    addMessage('user', cleaned);
+    setThinking(true);
+    playSound('send');
+    setTimeout(() => {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    }, 50);
+
+    const payload: Record<string, unknown> = {
+      type: 'chat:message',
+      message: cleaned,
+      mode: effectiveMode,
+      sessionId: sessionId.current,
+      talkMode: effectiveTalkMode,
+      showTechnicalDetails,
+      history: messages
+        .filter(m => m.type === 'user' || m.type === 'suny')
+        .map(m => ({ role: m.type === 'user' ? 'user' : 'assistant', content: m.content })),
+    };
+
+    if (effectiveProjectId) payload.projectId = effectiveProjectId;
+    else if (projects.length > 0) payload.projectNames = projects.map(p => p.name);
+
+    wsSend(payload);
+  }
+
+  async function sendMessage() {
+    await sendPreparedMessage(input);
+  }
+
+  async function changeMode(mode: string) {
+    if (noBalance && mode !== 'free') return;
+    setSelectedMode(mode);
+    await fetch('/api/me/mode', {
+      method: 'PATCH',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+  }
+
+  async function createProject() {
+    if (!newProjectName.trim() || !newProjectPath.trim()) return;
+    const trimmedPath = newProjectPath.trim();
+    const isAbsolute = /^[A-Za-z]:[\\//]/.test(trimmedPath) || trimmedPath.startsWith('/') || /^\\\\/.test(trimmedPath);
+    if (!isAbsolute) {
+      setNewProjectPathError('Please enter the full path to your project folder, like D:\\Projects\\MyApp');
+      return;
+    }
+    setNewProjectPathError('');
+    const res = await fetch('/api/projects', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newProjectName.trim(), local_path: trimmedPath }),
+    });
+    if (res.ok) {
+      await loadProjects();
+      setShowNewProject(false);
+      setNewProjectName('');
+      setNewProjectPath('');
+      setNewProjectPathError('');
+    } else {
+      const data = await res.json().catch(() => ({}));
+      const msg = data?.details?.fieldErrors?.local_path?.[0] || data?.error || 'Failed to create project';
+      setNewProjectPathError(msg);
+    }
+  }
+
+  async function pickFolderPath(onPicked: (path: string) => void) {
+    try {
+      const res = await fetch('/api/pick-folder', { method: 'POST', credentials: 'include' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setNewProjectPathError(data?.error || 'Folder picker is unavailable here. Please type the full folder path.');
+        return;
+      }
+      const data = await res.json() as { path?: string };
+      if (!data.path) return;
+      onPicked(data.path);
+      setNewProjectPathError('');
+    } catch {
+      setNewProjectPathError('Unable to open folder picker. Please type the full folder path.');
+    }
+  }
+
+  async function deleteProject(id: number) {
+    await fetch(`/api/projects/${id}`, { method: 'DELETE', credentials: 'include' });
+    setProjects(ps => ps.filter(p => p.id !== id));
+    setProjectSpend(prev => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    if (activeProject?.id === id) setActiveProject(null);
+  }
+
+  function clearChat() {
+    // Save conversation as a memory before clearing
+    if (activeProject && messages.length > 0) {
+      const userMsgs = messages.filter(m => m.type === 'user').map(m => m.content);
+      const lastUserMsg = userMsgs[userMsgs.length - 1] || '';
+      const title = lastUserMsg.length > 60 ? lastUserMsg.slice(0, 57) + '…' : (lastUserMsg || 'Chat session');
+      // Build a compact summary: last user message + count of messages
+      const summary = `${messages.length} messages · Last asked: "${lastUserMsg.slice(0, 120)}"`;
+      addMemory(title, summary);
+    }
+    setMessages([]);
+    setThinking(false);
+    setStreamingContent('');
+    streamingContentRef.current = '';
+    clearThinkingTimeout();
+    setSessUsed(0);
+    sessionId.current = 's_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+    setThinkingStatus('');
+    setProofRuns([]);
+    setExpandedRunIds(new Set());
+    activeProofIdRef.current = null;
+    if (activeProject) {
+      localStorage.removeItem(storageKey(activeProject.id));
+    } else {
+      try {
+        localStorage.removeItem(globalTabKey(activeTabId));
+        localStorage.removeItem(globalChatKey);
+      } catch {}
+    }
+    localStorage.removeItem(proofHistoryKey);
+  }
+
+  async function handleLogout() {
+    await fetch('/api/logout', { method: 'POST', credentials: 'include' });
+    onLogout();
+  }
+
+  const modes = userData?.modes || [];
+  const noBalance = balance <= 0 && walletBalance <= 0;
+  const activeSpend = activeProject ? projectSpend[activeProject.id] : null;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: 'var(--bg)' }}>
+      {/* Top bar */}
+      <div className="topbar" style={{
+        display: 'flex',
+        alignItems: 'center',
+        padding: '0 16px',
+        height: 52,
+        borderBottom: '1px solid var(--border)',
+        gap: 8,
+        flexShrink: 0,
+        position: 'relative',
+      }}>
+        {/* LEFT: brand + username + active project */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0 }}>
+          <img src="/SLOGO.png" alt="SUNy" style={{ width: 36, height: 36, borderRadius: '50%', objectFit: 'cover', flexShrink: 0 }} />
+          <span className="suny-logo" style={{ fontWeight: 700, fontSize: 16, color: 'var(--accent)', marginRight: 2 }}>SUNy</span>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', fontStyle: 'italic', opacity: 0.75, whiteSpace: 'nowrap' }}>Consider it done.</span>
+          {userData?.username && (
+            <span style={{
+              fontSize: 11, color: 'var(--text-secondary)',
+              background: 'var(--surface)', border: '1px solid var(--border)',
+              borderRadius: 999, padding: '2px 8px', whiteSpace: 'nowrap',
+              overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 120,
+            }} title={userData.username}>
+              {userData.username}
+            </span>
+          )}
+          {activeProject && (
+            <span style={{ color: 'var(--text-secondary)', fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>· {activeProject.name}</span>
+          )}
+          {activeSpend && (
+            <span style={{ color: 'var(--text-muted)', fontSize: 11, whiteSpace: 'nowrap', display: 'none' }}>· {formatSpend(activeSpend.total_cost)}</span>
+          )}
+        </div>
+
+        {/* CENTER: Mode selector + routing badge */}
+        <div style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)', display: 'flex', alignItems: 'center', gap: 8, pointerEvents: 'auto' }}>
+          {modes.length > 0 && (
+            <ModeSelector modes={modes} selected={selectedMode} onChange={changeMode} noBalance={noBalance} />
+          )}
+          {routingReason && (
+            <div
+              style={{
+                display: 'flex', alignItems: 'center', gap: 5,
+                padding: '3px 8px', background: 'rgba(108,99,255,0.08)',
+                border: '1px solid rgba(108,99,255,0.2)', borderRadius: 6,
+                fontSize: 11, color: 'var(--accent)', cursor: 'pointer',
+              }}
+              title={routingReason}
+            >
+              <span>{routingIcon(resolvedMode)}</span>
+              <span style={{ maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {routingReason}
+              </span>
+            </div>
+          )}
+        </div>
+
+        {/* RIGHT: action buttons */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 1, justifyContent: 'flex-end' }}>
+          {activeProject && (
+            <button
+              className="btn btn-icon btn-secondary"
+              onClick={() => {
+                if (activeProject && messages.length > 0) saveProjectMessages(activeProject.id, messages);
+                setActiveProject(null);
+                setMessages([]);
+              }}
+              title="Home — back to global chat"
+            >
+              <Home size={15} />
+            </button>
+          )}
+          {messages.length > 0 && (
+            <button className="btn btn-icon btn-secondary" onClick={clearChat} title="Clear chat">
+              <Eraser size={15} />
+            </button>
+          )}
+          <BridgeStatusBadge
+            connected={bridgeConnected}
+            onClick={() => setShowBridgeTip(t => !t)}
+          />
+          <BalanceBadge
+            balance={balance}
+            walletBalance={walletBalance}
+            remainingTokens={sessLimit == null ? null : Math.max(0, sessLimit - sessUsed)}
+            onOpenWalletSettings={() => onOpenSettings('wallet', 'Opened Wallet Transfer in Settings')}
+          />
+          <button
+            className="btn btn-icon btn-secondary"
+            onClick={() => { setShowUsage(true); loadUsageStats(usageDays); }}
+            title="Usage stats"
+          >
+            <BarChart2 size={15} />
+          </button>
+          <button className="btn btn-icon btn-secondary" onClick={() => setShowHelp(true)} title="Keyboard shortcuts & help">
+            <HelpCircle size={15} />
+          </button>
+          <button className="btn btn-icon btn-secondary" onClick={() => onOpenSettings()} title="Settings">
+            <Settings size={15} />
+          </button>
+          <button className="btn btn-icon btn-secondary" onClick={() => navigate('/contact')} title="Contact Us">
+            <Phone size={15} />
+          </button>
+          <button className="btn btn-icon btn-secondary" onClick={handleLogout} title="Sign out">
+            <LogOut size={15} />
+          </button>
+        </div>
+      </div>
+
+      {/* Body */}
+      <div style={{ display: 'flex', flex: 1, overflow: 'hidden', minHeight: 0 }}>
+        {/* Projects sidebar */}
+        <div style={{
+          width: 220,
+          borderRight: '1px solid var(--border)',
+          display: 'flex',
+          flexDirection: 'column',
+          padding: '12px 0',
+          flexShrink: 0,
+        }}>
+          <div style={{ padding: '0 12px 8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span
+              style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}
+              onClick={() => setCollapsedSections(s => ({ ...s, projects: !s.projects }))}
+            >
+              {collapsedSections.projects ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+              Projects
+            </span>
+            <div style={{ display: 'flex', gap: 4 }}>
+              {activeProject && (
+                <button
+                  className="btn btn-icon btn-secondary btn-sm"
+                  onClick={() => {
+                    if (!bridgeConnected) { setShowBridgeTip(true); return; }
+                    setShowFileBrowser(v => { const next = !v; if (!v && activeProject) loadFileBrowser(activeProject.id); return next; });
+                  }}
+                  title={showFileBrowser ? 'Hide file browser' : (bridgeConnected ? 'Show file browser' : 'Bridge required — click to connect')}
+                >
+                  {showFileBrowser ? <FolderOpen size={12} /> : <Folder size={12} />}
+                </button>
+              )}
+              <button className="btn btn-icon btn-secondary btn-sm" onClick={() => setShowNewProject(true)} title="New project">
+                <Plus size={13} />
+              </button>
+            </div>
+          </div>
+
+          {!collapsedSections.projects && (
+            <>
+              {projects.map(p => {
+                const projectReport = summarizeProjectMessages(p.id);
+                return (
+                  <div
+                    key={p.id}
+                    onClick={() => {
+                      openProject(p);
+                    }}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '8px 12px',
+                      cursor: 'pointer',
+                      background: activeProject?.id === p.id ? 'rgba(108,99,255,0.1)' : 'transparent',
+                      borderLeft: activeProject?.id === p.id ? '2px solid var(--accent)' : '2px solid transparent',
+                    }}
+                  >
+                    <div style={{ minWidth: 0, flex: 1, display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div style={{
+                          fontSize: 13,
+                          color: activeProject?.id === p.id ? 'var(--text-primary)' : 'var(--text-secondary)',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}>
+                          {p.name}
+                        </div>
+                        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
+                          {(() => {
+                            const spend = projectSpend[p.id];
+                            return spend ? `Spent ${formatTokenCount(spend.total_tokens)} tok / ${formatSpend(spend.total_cost)}` : 'Spent 0 tok / $0.00';
+                          })()}
+                        </div>
+                      </div>
+                      <ReportBadgeButton report={projectReport} label="Project report" />
+                    </div>
+                    <button
+                      className="btn btn-icon btn-sm"
+                      onClick={e => { e.stopPropagation(); deleteProject(p.id); }}
+                      style={{ background: 'none', border: 'none', color: 'var(--text-muted)', padding: 2 }}
+                      title="Remove project"
+                    >
+                      <Trash2 size={11} />
+                    </button>
+                  </div>
+                );
+              })}
+
+              {projects.length === 0 && (
+                <p style={{ padding: '0 12px', fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                  No projects yet. Click + to add one.
+                </p>
+              )}
+            </>
+          )}
+
+          {/* Memories section */}
+          {activeProject && (
+            <>
+              <div style={{
+                padding: '16px 12px 6px', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                borderTop: '1px solid var(--border)', marginTop: 4,
+              }}>
+                <span
+                  style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}
+                  onClick={() => setCollapsedSections(s => ({ ...s, memories: !s.memories }))}
+                >
+                  {collapsedSections.memories ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+                  Memories
+                </span>
+                {memories.length > 0 && !collapsedSections.memories && (
+                  confirmClearMemories ? (
+                    <div style={{ display: 'flex', gap: 3, alignItems: 'center' }}>
+                      <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>Clear all?</span>
+                      <button
+                        className="btn btn-icon btn-sm"
+                        onClick={() => { if (activeProject) { setMemories([]); saveMemories(activeProject.id, []); } setConfirmClearMemories(false); }}
+                        title="Confirm clear"
+                        style={{ background: 'none', border: 'none', color: 'var(--error)', padding: 2, cursor: 'pointer', fontWeight: 700, fontSize: 12 }}
+                      >✓</button>
+                      <button
+                        className="btn btn-icon btn-sm"
+                        onClick={() => setConfirmClearMemories(false)}
+                        title="Cancel"
+                        style={{ background: 'none', border: 'none', color: 'var(--text-muted)', padding: 2, cursor: 'pointer', fontSize: 12 }}
+                      >✗</button>
+                    </div>
+                  ) : (
+                    <button
+                      className="btn btn-icon btn-sm"
+                      onClick={() => setConfirmClearMemories(true)}
+                      title="Clear all memories"
+                      style={{ background: 'none', border: 'none', color: 'var(--text-muted)', padding: 2, cursor: 'pointer', fontSize: 10 }}
+                    >
+                      <Trash2 size={11} />
+                    </button>
+                  )
+                )}
+              </div>
+
+              {!collapsedSections.memories && (
+                <>
+                  {memories.length === 0 && (
+                    <p style={{ padding: '0 12px', fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 4 }}>
+                      Clear a chat to save it here.
+                    </p>
+                  )}
+
+                  <div style={{ overflow: 'auto', maxHeight: 240 }}>
+                    {memories.map(m => (
+                      <div
+                        key={m.id}
+                        style={{
+                          padding: '8px 12px', cursor: 'pointer', borderBottom: '1px solid var(--border)',
+                          transition: 'background 0.15s',
+                        }}
+                        onClick={() => setRecallingMemory(m)}
+                        title="Click to recall this memory"
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                          <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {m.title}
+                          </span>
+                          <div style={{ display: 'flex', gap: 2, flexShrink: 0, marginLeft: 4 }}>
+                            <button
+                              className="btn btn-icon btn-sm"
+                              onClick={e => { e.stopPropagation(); setEditingMemory(m); setEditTitle(m.title); setEditSummary(m.summary); }}
+                              title="Edit memory"
+                              style={{ background: 'none', border: 'none', color: 'var(--text-muted)', padding: 2, cursor: 'pointer' }}
+                            >
+                              <Edit3 size={10} />
+                            </button>
+                            <button
+                              className="btn btn-icon btn-sm"
+                              onClick={e => { e.stopPropagation(); deleteMemory(m.id); }}
+                              title="Delete memory"
+                              style={{ background: 'none', border: 'none', color: 'var(--text-muted)', padding: 2, cursor: 'pointer' }}
+                            >
+                              <Trash2 size={10} />
+                            </button>
+                          </div>
+                        </div>
+                        <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: '2px 0 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {m.summary}
+                        </p>
+                        <p style={{ fontSize: 10, color: 'var(--text-muted)', opacity: 0.6, margin: '2px 0 0' }}>
+                          {new Date(m.createdAt).toLocaleDateString()}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </>
+          )}
+
+          {/* Project Rules (.suny-rules) section */}
+          {activeProject && (
+            <div style={{ borderTop: '1px solid var(--border)', marginTop: 4 }}>
+              <div style={{ padding: '12px 12px 6px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span
+                  style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}
+                  onClick={() => setCollapsedSections(s => ({ ...s, rules: !s.rules }))}
+                >
+                  {collapsedSections.rules ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+                  Rules
+                </span>
+                <button
+                  className="btn btn-icon btn-sm"
+                  onClick={() => { setRulesEditorContent(projectRules ?? ''); setShowRulesEditor(true); }}
+                  title="Edit project rules"
+                  style={{ background: 'none', border: 'none', color: 'var(--text-muted)', padding: 2, cursor: 'pointer' }}
+                >
+                  <Edit3 size={11} />
+                </button>
+              </div>
+              {!collapsedSections.rules && (projectRules ? (
+                <div style={{ padding: '0 12px 8px', fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.5, whiteSpace: 'pre-wrap', maxHeight: 100, overflowY: 'auto', opacity: 0.8 }}>
+                  {projectRules.slice(0, 300)}{projectRules.length > 300 ? '…' : ''}
+                </div>
+              ) : (
+                <p style={{ padding: '0 12px 8px', fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                  No rules set. Click ✏️ to add coding guidelines for this project.
+                </p>
+              ))}
+            </div>
+          )}
+
+          {/* Persona section */}
+          {activeProject && (
+            <div style={{ borderTop: '1px solid var(--border)', marginTop: 4 }}>
+              <div style={{ padding: '12px 12px 6px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span
+                  style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}
+                  onClick={() => setCollapsedSections(s => ({ ...s, persona: !s.persona }))}
+                >
+                  {collapsedSections.persona ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+                  Persona
+                </span>
+                <button
+                  className="btn btn-icon btn-sm"
+                  onClick={() => { setPersonaEditorContent(activeProject.persona ?? ''); setShowPersonaEditor(true); }}
+                  title="Edit AI persona for this project"
+                  style={{ background: 'none', border: 'none', color: 'var(--text-muted)', padding: 2, cursor: 'pointer' }}
+                >
+                  <User size={11} />
+                </button>
+              </div>
+              {!collapsedSections.persona && (activeProject.persona ? (
+                <div style={{ padding: '0 12px 8px', fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.5, whiteSpace: 'pre-wrap', maxHeight: 70, overflowY: 'auto', opacity: 0.8 }}>
+                  {activeProject.persona.slice(0, 200)}{(activeProject.persona?.length ?? 0) > 200 ? '…' : ''}
+                </div>
+              ) : (
+                <p style={{ padding: '0 12px 8px', fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                  No persona. Click 👤 to give SUNy a role for this project.
+                </p>
+              ))}
+            </div>
+          )}
+
+          {/* Blueprint Memory Graph section */}
+          {activeProject && blueprintEntries.length > 0 && (
+            <div style={{ borderTop: '1px solid var(--border)', marginTop: 4 }}>
+              <div style={{ padding: '12px 12px 6px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span
+                  style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}
+                  onClick={() => setCollapsedSections(s => ({ ...s, blueprint: s['blueprint'] !== false ? false : true }))}
+                >
+                  {collapsedSections['blueprint'] !== false ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+                  Blueprint
+                </span>
+                <button
+                  className="btn btn-icon btn-sm"
+                  onClick={() => loadBlueprintEntries(activeProject.id)}
+                  title="Refresh blueprint"
+                  style={{ background: 'none', border: 'none', color: 'var(--text-muted)', padding: 2, cursor: 'pointer', fontSize: 10 }}
+                >
+                  ↻
+                </button>
+              </div>
+              {collapsedSections['blueprint'] === false && (
+                <div style={{ overflowY: 'auto', maxHeight: 220 }}>
+                  {blueprintEntries.slice(0, 20).map(e => (
+                    <div key={e.id} style={{ padding: '6px 12px', borderBottom: '1px solid var(--border)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 2 }}>
+                        <span style={{
+                          fontSize: 9, fontWeight: 700, textTransform: 'uppercase',
+                          color: blueprintCategoryColor(e.category),
+                          border: `1px solid ${blueprintCategoryColor(e.category)}`,
+                          borderRadius: 3, padding: '1px 4px', flexShrink: 0,
+                        }}>
+                          {blueprintCategoryLabel(e.category)}
+                        </span>
+                        <span style={{ fontSize: 9, color: 'var(--text-muted)', flexShrink: 0 }}>
+                          {new Date(e.created_at).toLocaleDateString()}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={e.summary}>
+                        {e.summary}
+                      </div>
+                      {e.intent && (
+                        <div style={{ fontSize: 10, color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1 }} title={e.intent}>
+                          ↳ {e.intent}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* File Browser section */}
+          {activeProject && showFileBrowser && (
+            <div style={{ borderTop: '1px solid var(--border)', marginTop: 4 }}>
+              <div style={{ padding: '12px 12px 6px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  Files
+                </span>
+                <button
+                  className="btn btn-icon btn-sm"
+                  onClick={() => loadFileBrowser(activeProject.id)}
+                  title="Refresh file list"
+                  style={{ background: 'none', border: 'none', color: 'var(--text-muted)', padding: 2, cursor: 'pointer' }}
+                >
+                  ↻
+                </button>
+              </div>
+              <div style={{ maxHeight: 200, overflowY: 'auto', fontSize: 11 }}>
+                {fileBrowser.length === 0 && (
+                  <p style={{ padding: '0 12px 8px', color: 'var(--text-muted)' }}>No files loaded.</p>
+                )}
+                {fileBrowser.map(node => (
+                  <FileTreeNode
+                    key={node.path}
+                    node={node}
+                    expandedDirs={expandedDirs}
+                    onToggle={p => setExpandedDirs(prev => {
+                      const next = new Set(prev);
+                      next.has(p) ? next.delete(p) : next.add(p);
+                      return next;
+                    })}
+                    onFileClick={node => setInput(prev => prev + `\n@file:${node.path}`)}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Live Server section */}
+          {activeProject && bridgeConnected && (
+            <div style={{ borderTop: '1px solid var(--border)', marginTop: 4 }}>
+              <div style={{ padding: '12px 12px 8px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                    Dev Server
+                  </span>
+                  <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                    {devServerRunning && (
+                      <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--success)', display: 'inline-block' }} />
+                    )}
+                  </div>
+                </div>
+                {devServerRunning && devServerUrl ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <a
+                      href={devServerUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      style={{ fontSize: 11, color: 'var(--accent)', textDecoration: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                    >
+                      {devServerUrl}
+                    </a>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      style={{ fontSize: 11, padding: '3px 8px', color: 'var(--error)', borderColor: 'var(--error)' }}
+                      onClick={stopDevServer}
+                      disabled={devServerLoading}
+                    >
+                      {devServerLoading ? '…' : 'Stop'}
+                    </button>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                      Dev server ON means your app is running live for preview/testing. Turning it OFF only stops preview, not SUNy file access.
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      style={{ fontSize: 11, padding: '4px 10px', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
+                      onClick={() => { if (!bridgeConnected) { setShowBridgeTip(true); return; } startDevServer(); }}
+                      disabled={devServerLoading}
+                    >
+                      <Play size={11} />
+                      {devServerLoading ? 'Starting...' : 'Start Dev Server'}
+                    </button>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                      Dev server shows your app live in browser. Bridge controls file/terminal actions; dev server controls preview only.
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Checkpoints section */}
+          {activeProject && checkpoints.length > 0 && (
+            <div style={{ borderTop: '1px solid var(--border)', marginTop: 4 }}>
+              <div style={{ padding: '12px 12px 6px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  Checkpoints
+                </span>
+                <button
+                  className="btn btn-icon btn-sm"
+                  onClick={() => loadCheckpoints(activeProject.id)}
+                  title="Refresh checkpoints"
+                  style={{ background: 'none', border: 'none', color: 'var(--text-muted)', padding: 2, cursor: 'pointer', fontSize: 10 }}
+                >
+                  ↻
+                </button>
+              </div>
+              <div style={{ overflowY: 'auto', maxHeight: 180 }}>
+                {checkpoints.map(cp => (
+                  <div key={cp.sha} style={{ padding: '6px 12px', borderBottom: '1px solid var(--border)' }}>
+                    <div style={{ fontSize: 11, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 2 }}>
+                      {cp.message.replace('SUNy checkpoint: ', '')}
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 4 }}>
+                      <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: 'JetBrains Mono, monospace' }}>
+                          {cp.sha.slice(0, 7)}
+                        </span>
+                        {cp.date && (
+                          <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                            {new Date(cp.date).toLocaleDateString()} {new Date(cp.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </span>
+                        )}
+                        {cp.filesChanged !== undefined && cp.filesChanged > 0 && (
+                          <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                            {cp.filesChanged} file{cp.filesChanged !== 1 ? 's' : ''}
+                          </span>
+                        )}
+                      </div>
+                      {rollbackConfirm === cp.sha ? (
+                        <div style={{ display: 'flex', gap: 3, alignItems: 'center', flexShrink: 0 }}>
+                          <span style={{ fontSize: 10, color: 'var(--error)' }}>Overwrite?</span>
+                          <button
+                            className="btn btn-sm"
+                            onClick={() => rollbackToCheckpoint(cp.sha)}
+                            disabled={rollingBack === cp.sha}
+                            style={{ fontSize: 10, padding: '2px 5px', background: 'var(--error)', color: '#fff', border: 'none', borderRadius: 3, cursor: 'pointer' }}
+                          >
+                            {rollingBack === cp.sha ? '…' : 'Yes'}
+                          </button>
+                          <button
+                            className="btn btn-sm"
+                            onClick={() => setRollbackConfirm(null)}
+                            style={{ fontSize: 10, padding: '2px 5px', background: 'var(--surface)', color: 'var(--text-muted)', border: '1px solid var(--border)', borderRadius: 3, cursor: 'pointer' }}
+                          >
+                            No
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          className="btn btn-sm btn-secondary"
+                          onClick={() => setRollbackConfirm(cp.sha)}
+                          disabled={!!rollingBack}
+                          title="Roll back to this checkpoint"
+                          style={{ fontSize: 10, padding: '2px 6px', flexShrink: 0 }}
+                        >
+                          Restore
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Chat area */}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minHeight: 0 }}>
+          {/* Messages */}
+          <div style={{ flex: 1, overflow: 'auto', padding: '20px 24px' }}>
+        {messages.length > 0 && (
+          <button
+            className="btn btn-icon btn-secondary btn-sm"
+            onClick={clearChat}
+            title="Clear chat"
+            style={{
+              position: 'sticky', top: 0, float: 'right', zIndex: 10,
+              margin: '0 0 8px 0', opacity: 0.55,
+            }}
+          >
+            <Eraser size={13} />
+          </button>
+        )}
+
+            {/* Global chat: tab bar */}
+            {!activeProject && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 16, flexWrap: 'wrap' }}>
+                {globalTabs.map(tab => (
+                  <div
+                    key={tab.id}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 4,
+                      padding: '4px 10px 4px 12px',
+                      borderRadius: 20,
+                      border: `1px solid ${activeTabId === tab.id ? 'var(--accent)' : 'var(--border)'}`,
+                      background: activeTabId === tab.id ? 'rgba(41,255,122,0.08)' : 'var(--surface)',
+                      cursor: 'pointer',
+                      fontSize: 12,
+                      color: activeTabId === tab.id ? 'var(--accent)' : 'var(--text-secondary)',
+                      transition: 'all 0.15s',
+                    }}
+                    onClick={() => switchGlobalTab(tab.id)}
+                    onDoubleClick={() => { setRenamingTabId(tab.id); setRenamingTabValue(tab.name); }}
+                  >
+                    {renamingTabId === tab.id ? (
+                      <input
+                        value={renamingTabValue}
+                        onChange={e => setRenamingTabValue(e.target.value)}
+                        onBlur={() => {
+                          if (renamingTabValue.trim()) {
+                            const updated = globalTabs.map(t => t.id === tab.id ? { ...t, name: renamingTabValue.trim() } : t);
+                            setGlobalTabs(updated);
+                            saveGlobalTabs(updated);
+                          }
+                          setRenamingTabId(null);
+                        }}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+                          if (e.key === 'Escape') { setRenamingTabId(null); }
+                        }}
+                        autoFocus
+                        style={{ width: 80, fontSize: 12, padding: '0 2px', background: 'transparent', border: 'none', outline: 'none', color: 'inherit' }}
+                        onClick={e => e.stopPropagation()}
+                      />
+                    ) : (
+                      <span>{tab.name}</span>
+                    )}
+                    <button
+                      onClick={e => { e.stopPropagation(); closeGlobalTab(tab.id); }}
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 0, display: 'flex', alignItems: 'center', fontSize: 10, lineHeight: 1 }}
+                      title="Close tab"
+                    >
+                      <X size={10} />
+                    </button>
+                  </div>
+                ))}
+                <button
+                  onClick={addGlobalTab}
+                  style={{
+                    width: 24, height: 24, borderRadius: '50%',
+                    border: '1px solid var(--border)', background: 'var(--surface)',
+                    color: 'var(--text-muted)', cursor: 'pointer', display: 'flex',
+                    alignItems: 'center', justifyContent: 'center',
+                    fontSize: 14, lineHeight: 1,
+                  }}
+                  title="New chat tab"
+                >+</button>
+              </div>
+            )}
+            {!activeProject && messages.length === 0 && !thinking && (
+              <div style={{ textAlign: 'center', marginTop: 48, color: 'var(--text-muted)', padding: '0 24px' }}>
+                <img src="/SLOGO.png" alt="SUNy" style={{ width: 200, height: 200, borderRadius: '50%', objectFit: 'cover', marginBottom: 14, boxShadow: '0 4px 20px rgba(108,99,255,0.2)' }} />
+                <p style={{ fontWeight: 700, fontSize: 22, color: 'var(--text-primary)', marginBottom: 4 }}>SUNy</p>
+                <p style={{ fontSize: 13, fontStyle: 'italic', color: 'var(--accent)', marginBottom: 20, opacity: 0.9 }}>Consider it done.</p>
+                <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 24, lineHeight: 1.6 }}>
+                  {globalIntroLine || 'Pick a project from the sidebar to start coding.'}
+                </p>
+                {projects.length > 0 && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center', marginBottom: 24 }}>
+                    {projects.map(p => (
+                      <button
+                        key={p.id}
+                        className="btn btn-secondary btn-sm"
+                        style={{ fontSize: 12, padding: '5px 12px', borderRadius: 20, display: 'flex', alignItems: 'center', gap: 6 }}
+                        onClick={() => {
+                          openProject(p);
+                        }}
+                      >
+                        <FolderOpen size={12} />
+                        {p.name}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {!bridgeConnected && (
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)', opacity: 0.7 }}>
+                    <button
+                      onClick={() => setShowBridgeTip(true)}
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--accent)', fontSize: 12, padding: 0, textDecoration: 'underline' }}
+                    >
+                      🔌 Connect the Bridge
+                    </button>{' '}to unlock file editing & shell commands.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {activeProject && messages.length === 0 && !thinking && (
+              <div style={{ textAlign: 'center', marginTop: 40, color: 'var(--text-muted)' }}>
+                <img src="/SLOGO.png" alt="SUNy" style={{ width: 'clamp(260px, 46vw, 560px)', height: 'clamp(260px, 46vw, 560px)', borderRadius: '50%', objectFit: 'cover', marginBottom: 20, boxShadow: '0 8px 32px rgba(108,99,255,0.25)' }} />
+                <p style={{ fontWeight: 700, fontSize: 22, marginBottom: 6, color: 'var(--text-primary)' }}>Hi! I'm SUNy</p>
+                <p style={{ fontSize: 13, fontStyle: 'italic', color: 'var(--accent)', marginBottom: 10, opacity: 0.9 }}>Consider it done.</p>
+                <p style={{ fontSize: 14 }}>Tell me what you'd like to build or fix. I'll take it from there!</p>
+                {!bridgeConnected && (
+                  <p style={{ fontSize: 12, marginTop: 12, color: 'var(--text-muted)', opacity: 0.7 }}>
+                    <button
+                      onClick={() => setShowBridgeTip(true)}
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--accent)', fontSize: 12, padding: 0, textDecoration: 'underline' }}
+                    >
+                      🔌 Connect the Bridge
+                    </button>{' '}to unlock file editing & shell commands.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {proofRuns.length > 0 && (
+              <div
+                style={{
+                  marginBottom: 12,
+                  border: '1px solid var(--border)',
+                  borderRadius: 'var(--radius-sm)',
+                  background: 'var(--surface)',
+                  padding: '0',
+                  overflow: 'hidden',
+                }}
+              >
+                {/* Proof Panel Header */}
+                <div style={{
+                  padding: '10px 12px',
+                  borderBottom: proofRuns.length > 1 ? '1px solid var(--border)' : 'none',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  gap: 10,
+                }}>
+                  <strong style={{ fontSize: 12, color: 'var(--text-primary)' }}>
+                    Proof Panel {proofRuns.length > 1 ? `(${proofRuns.length})` : ''}
+                  </strong>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                    {proofRuns[0].status === 'running' ? '🔄 In progress' : proofRuns[0].status === 'completed' ? '✅ Completed' : '⚠️ Needs attention'}
+                  </div>
+                </div>
+
+                {/* Active Run (always shown) */}
+                <div style={{
+                  padding: '8px 12px',
+                  borderBottom: proofRuns.length > 1 ? '1px solid var(--border)' : 'none',
+                  background: 'rgba(108,99,255,0.05)',
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                    <strong style={{ fontSize: 11, color: 'var(--accent)' }}>Active Run</strong>
+                    {proofRuns[0].status === 'completed' && (
+                      <button
+                        onClick={() => copyProofReportToClipboard(proofRuns[0])}
+                        style={{
+                          background: 'none',
+                          border: 'none',
+                          cursor: 'pointer',
+                          color: 'var(--accent)',
+                          fontSize: 11,
+                          padding: '2px 6px',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 4,
+                        }}
+                        title="Copy proof report"
+                      >
+                        <Copy size={11} /> Copy
+                      </button>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                    <strong style={{ color: 'var(--text-primary)' }}>Tools:</strong>{' '}
+                    {proofRuns[0].toolCalls.length > 0
+                      ? proofRuns[0].toolCalls.map(toolLabel).join(' → ')
+                      : 'None yet'}
+                  </div>
+                  {proofRuns[0].checks.length > 0 && (
+                    <div style={{ fontSize: 10, color: 'var(--text-secondary)', marginTop: 2 }}>
+                      <strong style={{ color: 'var(--text-primary)' }}>Last checks:</strong> {proofRuns[0].checks.slice(-2).join(' | ')}
+                    </div>
+                  )}
+                </div>
+
+                {/* Run History (collapsible) */}
+                {proofRuns.length > 1 && (
+                  <div style={{ borderTop: '1px solid var(--border)' }}>
+                    <div
+                      onClick={() => setExpandedRunIds(prev => {
+                        const next = new Set(prev);
+                        if (next.has(-1)) next.delete(-1);
+                        else next.add(-1);
+                        return next;
+                      })}
+                      style={{
+                        padding: '6px 12px',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        fontSize: 11,
+                        color: 'var(--text-muted)',
+                        userSelect: 'none',
+                      }}
+                    >
+                      {expandedRunIds.has(-1) ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                      <span>Earlier runs ({proofRuns.length - 1})</span>
+                    </div>
+
+                    {expandedRunIds.has(-1) && (
+                      <div style={{ maxHeight: 300, overflowY: 'auto' }}>
+                        {proofRuns.slice(1).map((run, idx) => {
+                          const isExpanded = expandedRunIds.has(run.id);
+                          const duration = run.durationMs ?? ((run.finishedAt ?? Date.now()) - run.startedAt);
+                          const durationSec = (duration / 1000).toFixed(1);
+                          return (
+                            <div key={run.id} style={{ borderTop: '1px solid var(--border)', padding: 0 }}>
+                              <div
+                                onClick={() => setExpandedRunIds(prev => {
+                                  const next = new Set(prev);
+                                  if (next.has(run.id)) next.delete(run.id);
+                                  else next.add(run.id);
+                                  return next;
+                                })}
+                                style={{
+                                  padding: '6px 12px',
+                                  cursor: 'pointer',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: 6,
+                                  fontSize: 10,
+                                  color: 'var(--text-secondary)',
+                                  userSelect: 'none',
+                                }}
+                              >
+                                {isExpanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                                <span style={{
+                                  color: run.status === 'completed' ? 'var(--success)' : run.status === 'failed' ? 'var(--error)' : 'var(--warning)',
+                                  fontWeight: 600,
+                                }}>
+                                  {run.status === 'completed' ? '✓' : run.status === 'failed' ? '✗' : '○'}
+                                </span>
+                                <span>{new Date(run.startedAt).toLocaleTimeString()}</span>
+                                <span>· {durationSec}s</span>
+                                <span>· {run.toolCalls.length} tools</span>
+                              </div>
+
+                              {isExpanded && (
+                                <div style={{
+                                  padding: '6px 12px 8px 24px',
+                                  fontSize: 10,
+                                  background: 'rgba(0,0,0,0.15)',
+                                  borderTop: '1px solid var(--border)',
+                                }}>
+                                  {run.toolCalls.length > 0 && (
+                                    <div style={{ marginBottom: 4, color: 'var(--text-secondary)' }}>
+                                      <strong>Tools:</strong> {run.toolCalls.map(toolLabel).join(', ')}
+                                    </div>
+                                  )}
+                                  {run.filesChanged !== undefined && (
+                                    <div style={{ marginBottom: 4, color: 'var(--text-secondary)' }}>
+                                      <strong>Files:</strong> {run.filesChanged} changed
+                                    </div>
+                                  )}
+                                  {run.steps !== undefined && (
+                                    <div style={{ marginBottom: 4, color: 'var(--text-secondary)' }}>
+                                      <strong>Steps:</strong> {run.steps}
+                                    </div>
+                                  )}
+                                  {run.status === 'completed' && (
+                                    <button
+                                      onClick={() => copyProofReportToClipboard(run)}
+                                      style={{
+                                        background: 'none',
+                                        border: 'none',
+                                        cursor: 'pointer',
+                                        color: 'var(--accent)',
+                                        fontSize: 10,
+                                        padding: 0,
+                                        marginTop: 4,
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: 3,
+                                      }}
+                                      title="Copy proof report"
+                                    >
+                                      <Copy size={9} /> Copy report
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {messages.map(m => (
+              <NarratedMessage key={m.id} message={m.content} type={m.type} timestamp={m.timestamp} report={m.report} />
+            ))}
+            {thinking && streamingContent && (
+              <>
+                <NarratedMessage message={streamingContent} type="suny" isActive={true} timestamp={Date.now()} />
+                {thinkingStatus && (
+                  <div style={{
+                    display: 'flex', gap: 8, marginLeft: 38, marginBottom: 12,
+                    alignItems: 'center', fontSize: 12, color: 'var(--text-muted)', fontStyle: 'italic',
+                  }}>
+                    <span style={{
+                      display: 'inline-block', width: 6, height: 6, borderRadius: '50%',
+                      background: 'var(--accent)', opacity: 0.7, flexShrink: 0,
+                    }} />
+                    {thinkingStatus}
+                  </div>
+                )}
+              </>
+            )}
+            {thinking && !streamingContent && <ThinkingIndicator statusText={thinkingStatus} />}
+            <div ref={msgEndRef} />
+          </div>
+
+          {/* Input — always visible */}
+            <div className="chat-input-area" style={{
+              padding: '12px 20px 16px',
+              borderTop: '1px solid var(--border)',
+              display: 'flex',
+              gap: 10,
+              alignItems: 'flex-end',
+            }}>
+              <>
+                {balance <= 0 && walletBalance <= 0 && !thinking && (
+                  <div style={{
+                    flex: 1,
+                    padding: '8px 12px',
+                    borderRadius: 'var(--radius-sm)',
+                    background: 'rgba(255,107,107,0.10)',
+                    border: '1px solid rgba(255,107,107,0.55)',
+                    color: 'rgba(255,107,107,0.95)',
+                    fontSize: 12,
+                    textAlign: 'center',
+                    marginBottom: 6,
+                    boxShadow: '0 0 0 1px rgba(255,107,107,0.08) inset',
+                  }}>
+                    Main credits are empty. Free talk mode stays on, and paid modes are locked until you top up.
+                  </div>
+                )}
+                  <textarea
+                    ref={inputRef}
+                    value={input}
+                    onChange={e => { setInput(e.target.value); inputHistoryIndex.current = -1; }}
+                    placeholder={thinking ? 'SUNy is working...' : activeProject && !bridgeConnected ? 'Bridge offline — I can still reason, explain, and review code! Type your question...' : 'Type your goal here... e.g. Add a dark mode toggle to my app'}
+                    rows={2}
+                    spellCheck={false}
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' && !e.shiftKey && !thinking) { e.preventDefault(); sendMessage(); return; }
+                      if (e.key === 'ArrowUp' && !e.shiftKey && !thinking) {
+                        const userMsgs = messages.filter(m => m.type === 'user').map(m => m.content);
+                        if (userMsgs.length === 0) return;
+                        // Only intercept if cursor is on the first line (or field is empty)
+                        const ta = e.currentTarget;
+                        const onFirstLine = ta.selectionStart === 0 || !ta.value.slice(0, ta.selectionStart).includes('\n');
+                        if (!onFirstLine) return;
+                        e.preventDefault();
+                        const next = Math.min(inputHistoryIndex.current + 1, userMsgs.length - 1);
+                        inputHistoryIndex.current = next;
+                        setInput(userMsgs[userMsgs.length - 1 - next]);
+                        return;
+                      }
+                      if (e.key === 'ArrowDown' && !e.shiftKey && !thinking && inputHistoryIndex.current >= 0) {
+                        const userMsgs = messages.filter(m => m.type === 'user').map(m => m.content);
+                        e.preventDefault();
+                        const next = inputHistoryIndex.current - 1;
+                        if (next < 0) { inputHistoryIndex.current = -1; setInput(''); }
+                        else { inputHistoryIndex.current = next; setInput(userMsgs[userMsgs.length - 1 - next]); }
+                        return;
+                      }
+                    }}
+                    style={{ flex: 1, resize: 'none', maxHeight: 120 }}
+                    disabled={thinking}
+                  />
+                  {/* Talk / Write mode toggle */}
+                  <button
+                    className="btn btn-icon btn-secondary"
+                    onClick={toggleTalkMode}
+                    title={talkMode ? 'Talk Mode — no file changes (click to switch to Write Mode)' : 'Write Mode — full file editing (click to switch to Talk Mode)'}
+                    style={{
+                      alignSelf: 'flex-end',
+                      padding: '10px 12px',
+                      background: talkMode ? 'rgba(108,99,255,0.12)' : 'transparent',
+                      border: talkMode ? '1px solid var(--accent)' : '1px solid var(--border)',
+                      color: talkMode ? 'var(--accent)' : 'var(--text-muted)',
+                      transition: 'all 0.15s',
+                    }}
+                  >
+                    {talkMode ? <MessageSquare size={15} /> : <Pencil size={15} />}
+                  </button>
+                  {thinking ? (
+                    <button
+                      className="btn btn-danger"
+                      onClick={() => wsSend({ type: 'chat:cancel', requestId: '' })}
+                      style={{ padding: '10px 16px', alignSelf: 'flex-end' }}
+                      title="Stop responding"
+                    >
+                      <Square size={15} />
+                    </button>
+                  ) : (
+                    <button
+                      className="btn btn-primary"
+                      onClick={sendMessage}
+                      disabled={!input.trim()}
+                      style={{ padding: '10px 16px', alignSelf: 'flex-end' }}
+                    >
+                      <Send size={15} />
+                    </button>
+                  )}
+                </>
+            </div>
+        </div>
+      </div>
+
+      {/* Bridge connect modal */}
+      {showBridgeTip && (
+        <div className="modal-overlay" onClick={() => setShowBridgeTip(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 480 }}>
+            {bridgeConnected ? (
+              <>
+                <div style={{ textAlign: 'center', padding: '12px 0 8px' }}>
+                  <div style={{ fontSize: 32, marginBottom: 6 }}>🟢</div>
+                  <h3 style={{ margin: '0 0 6px', fontSize: 17 }}>Bridge connected!</h3>
+                  <p style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                    SUNy can now read &amp; write files, run shell commands, fix lint errors, and auto-commit.
+                  </p>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
+                  <button className="btn btn-primary" onClick={() => setShowBridgeTip(false)}>Close</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <h3 style={{ margin: '0 0 4px', fontSize: 17 }}>🔌 Connect the Bridge</h3>
+                <p style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5, margin: '0 0 6px' }}>
+                  The Bridge is a small background process that runs on <strong>your computer</strong>.
+                  SUNy needs it to <strong>create files, edit code, and run commands</strong>.
+                </p>
+
+                {/* Capability comparison */}
+                <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+                  <div style={{ flex: 1, background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.4px' }}>Without Bridge</div>
+                    {['💬 Chat & answer questions', '🧠 Code review & analysis', '📋 Architecture advice'].map(t => (
+                      <div key={t} style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 3 }}>{t}</div>
+                    ))}
+                  </div>
+                  <div style={{ flex: 1, background: 'rgba(108,99,255,0.07)', border: '1px solid rgba(108,99,255,0.2)', borderRadius: 8, padding: '10px 12px' }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.4px' }}>With Bridge ✨</div>
+                    {['✏️ Create & edit files', '⚡ Run shell commands', '🔧 Auto-fix lint errors', '📦 Git auto-commit'].map(t => (
+                      <div key={t} style={{ fontSize: 12, color: 'var(--text-primary)', marginBottom: 3 }}>{t}</div>
+                    ))}
+                  </div>
+                </div>
+
+                <BridgeInstallInstructions autoCopy />
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 16, gap: 8 }}>
+                  <button
+                    className="btn btn-primary"
+                    style={{ display: 'flex', alignItems: 'center', gap: 7, flex: 1, justifyContent: 'center', background: terminalLaunched ? 'var(--success)' : undefined }}
+                    onClick={launchBridgeTerminal}
+                    disabled={terminalLaunching}
+                    title="Opens a PowerShell window — just press Enter inside it"
+                  >
+                    <span style={{ fontSize: 15 }}>{terminalLaunched ? '✓' : terminalLaunching ? '…' : '⚡'}</span>
+                    {terminalLaunched ? 'Terminal opened!' : terminalLaunching ? 'Opening...' : 'Open Terminal & Run'}
+                  </button>
+                  <button className="btn btn-secondary" onClick={() => setShowBridgeTip(false)}>Close</button>
+                </div>
+                {terminalLaunched && (
+                  <p style={{ fontSize: 12, color: 'var(--success)', marginTop: 8, textAlign: 'center', fontWeight: 500 }}>
+                    ✓ A PowerShell window just opened — press Enter inside it to install.
+                  </p>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Recall Memory Modal */}
+      {recallingMemory && (
+        <div className="modal-overlay" onClick={() => setRecallingMemory(null)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <h3 className="modal-title">Recall Memory</h3>
+            <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 8 }}>Insert this memory into a fresh chat?</p>
+            <div style={{ background: 'var(--bg)', padding: 12, borderRadius: 'var(--radius)', marginBottom: 16 }}>
+              <p style={{ fontWeight: 600, fontSize: 14, marginBottom: 4 }}>{recallingMemory.title}</p>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>{recallingMemory.summary}</p>
+            </div>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button className="btn btn-secondary" onClick={() => setRecallingMemory(null)}>Cancel</button>
+              <button className="btn btn-primary" onClick={() => recallMemory(recallingMemory)}>
+                <RotateCcw size={14} style={{ marginRight: 6 }} />Recall
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Memory Modal */}
+      {editingMemory && (
+        <div className="modal-overlay" onClick={() => setEditingMemory(null)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <h3 className="modal-title">Edit Memory</h3>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div>
+                <label style={{ fontSize: 12, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>Title</label>
+                <input value={editTitle} onChange={e => setEditTitle(e.target.value)} autoFocus />
+              </div>
+              <div>
+                <label style={{ fontSize: 12, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>Summary</label>
+                <textarea
+                  value={editSummary}
+                  onChange={e => setEditSummary(e.target.value)}
+                  rows={3}
+                  style={{ width: '100%', resize: 'vertical' }}
+                />
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 8, marginTop: 20, justifyContent: 'flex-end' }}>
+              <button className="btn btn-secondary" onClick={() => setEditingMemory(null)}>Cancel</button>
+              <button
+                className="btn btn-primary"
+                onClick={() => {
+                  if (editingMemory && editTitle.trim()) {
+                    updateMemory(editingMemory.id, editTitle.trim(), editSummary.trim());
+                    setEditingMemory(null);
+                  }
+                }}
+                disabled={!editTitle.trim()}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Project Rules Editor Modal */}
+      {showRulesEditor && activeProject && (
+        <div className="modal-overlay" onClick={() => setShowRulesEditor(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 560 }}>
+            <h3 className="modal-title">
+              <FileText size={16} style={{ marginRight: 8, verticalAlign: 'text-bottom' }} />
+              Project Rules — {activeProject.name}
+            </h3>
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12, lineHeight: 1.5 }}>
+              These rules are saved to <code style={{ background: 'var(--bg)', padding: '1px 4px', borderRadius: 3 }}>.suny-rules</code> in your project folder and injected into every conversation for this project.
+              <br />Write coding preferences, forbidden patterns, naming conventions, or anything SUNy should always follow.
+            </p>
+            <textarea
+              value={rulesEditorContent}
+              onChange={e => setRulesEditorContent(e.target.value)}
+              placeholder={"# Project Rules\n\n- Use TypeScript strict mode\n- Prefer functional components\n- All API routes must be RESTful\n- Never use console.log in production code"}
+              rows={12}
+              autoFocus
+              style={{ width: '100%', fontFamily: 'JetBrains Mono, monospace', fontSize: 12, resize: 'vertical', boxSizing: 'border-box' }}
+            />
+            <div style={{ display: 'flex', gap: 8, marginTop: 12, justifyContent: 'flex-end' }}>
+              <button className="btn btn-secondary" onClick={() => setShowRulesEditor(false)}>Cancel</button>
+              {projectRules && (
+                <button
+                  className="btn btn-secondary"
+                  style={{ color: 'var(--error)', borderColor: 'var(--error)' }}
+                  onClick={async () => {
+                    await fetch(`/api/projects/${activeProject.id}/rules`, { method: 'DELETE', credentials: 'include' });
+                    setProjectRules(null);
+                    setShowRulesEditor(false);
+                  }}
+                >
+                  <Trash2 size={13} style={{ marginRight: 6 }} />Delete Rules
+                </button>
+              )}
+              <button
+                className="btn btn-primary"
+                onClick={() => saveProjectRulesApi(rulesEditorContent)}
+              >
+                Save Rules
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* New Project Modal */}
+      {showNewProject && (
+        <div className="modal-overlay" onClick={() => setShowNewProject(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <h3 className="modal-title">New Project</h3>
+
+            {/* Tab switcher */}
+            <div style={{ display: 'flex', gap: 0, marginBottom: 16, borderRadius: 6, overflow: 'hidden', border: '1px solid var(--border)' }}>
+              <button
+                onClick={() => setNewProjectMode('link')}
+                style={{
+                  flex: 1, padding: '7px 0', fontSize: 12, fontWeight: 600, cursor: 'pointer', border: 'none',
+                  background: newProjectMode === 'link' ? 'var(--accent)' : 'transparent',
+                  color: newProjectMode === 'link' ? '#fff' : 'var(--text-muted)',
+                }}
+              >
+                📁 Link Existing
+              </button>
+              <button
+                onClick={() => setNewProjectMode('scratch')}
+                style={{
+                  flex: 1, padding: '7px 0', fontSize: 12, fontWeight: 600, cursor: 'pointer', border: 'none',
+                  background: newProjectMode === 'scratch' ? 'var(--accent)' : 'transparent',
+                  color: newProjectMode === 'scratch' ? '#fff' : 'var(--text-muted)',
+                }}
+              >
+                ✨ Build with SUNy
+              </button>
+            </div>
+
+            {newProjectMode === 'link' ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div>
+                <label style={{ fontSize: 12, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>Project Name</label>
+                <input
+                  value={newProjectName}
+                  onChange={e => setNewProjectName(e.target.value)}
+                  placeholder="My Awesome App"
+                  autoFocus
+                />
+              </div>
+              <div>
+                <label style={{ fontSize: 12, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>📁 Project Folder</label>
+                {/* Primary: big folder pick button */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    pickFolderPath((picked) => {
+                      setNewProjectPath(picked);
+                      const parts = picked.replace(/\\/g, '/').split('/').filter(Boolean);
+                      if (!newProjectName) setNewProjectName(parts[parts.length - 1] || '');
+                    });
+                  }}
+                  style={{
+                    width: '100%',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
+                    padding: '14px 0', borderRadius: 8, border: '2px dashed var(--border)',
+                    cursor: 'pointer', marginBottom: 8, color: 'var(--text-muted)',
+                    background: 'var(--bg-secondary)',
+                    transition: 'border-color 0.2s',
+                  }}
+                  title="Choose folder"
+                  onMouseEnter={e => ((e.currentTarget as HTMLElement).style.borderColor = 'var(--accent)')}
+                  onMouseLeave={e => ((e.currentTarget as HTMLElement).style.borderColor = 'var(--border)')}
+                >
+                  <FolderOpen size={22} style={{ color: 'var(--accent)' }} />
+                  <span style={{ fontSize: 13 }}>{newProjectPath ? newProjectPath : 'Click to choose a folder'}</span>
+                </button>
+                {/* Fallback: manual text input */}
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input
+                    value={newProjectPath}
+                    onChange={e => { setNewProjectPath(e.target.value); setNewProjectPathError(''); }}
+                    placeholder="Or type path manually, e.g. C:\\Users\\me\\projects\\my-app"
+                    style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 12, flex: 1, borderColor: newProjectPathError ? 'var(--color-error, #e74c3c)' : undefined }}
+                  />
+                </div>
+                {newProjectPathError && (
+                  <div style={{ fontSize: 12, color: 'var(--color-error, #e74c3c)', marginTop: 4 }}>
+                    {newProjectPathError}
+                  </div>
+                )}
+              </div>
+            </div>
+            ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div>
+                <label style={{ fontSize: 12, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>Project Name</label>
+                <input
+                  value={newProjectName}
+                  onChange={e => setNewProjectName(e.target.value)}
+                  placeholder="My Awesome App"
+                  autoFocus
+                />
+              </div>
+              <div>
+                <label style={{ fontSize: 12, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>📁 Where to create it</label>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input
+                    value={newProjectPath}
+                    onChange={e => { setNewProjectPath(e.target.value); setNewProjectPathError(''); }}
+                    placeholder="e.g. C:\\Users\\me\\projects"
+                    style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 12, flex: 1 }}
+                  />
+                  <button
+                    className="btn btn-secondary"
+                    type="button"
+                    style={{ whiteSpace: 'nowrap', marginBottom: 0 }}
+                    title="Browse parent folder"
+                    onClick={() => pickFolderPath(setNewProjectPath)}
+                  >
+                    📁
+                  </button>
+                </div>
+                {newProjectPathError && (
+                  <div style={{ fontSize: 12, color: 'var(--color-error, #e74c3c)', marginTop: 4 }}>
+                    {newProjectPathError}
+                  </div>
+                )}
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+                  SUNy will create a <code>{newProjectName || 'project'}</code> subfolder here.
+                </div>
+              </div>
+              <div>
+                <label style={{ fontSize: 12, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>
+                  <Sparkles size={12} style={{ marginRight: 4 }} />
+                  Describe what you want to build
+                </label>
+                <textarea
+                  value={scratchDescription}
+                  onChange={e => setScratchDescription(e.target.value)}
+                  placeholder="e.g. A to-do app with React and a dark theme, with the ability to add, delete, and mark tasks as done."
+                  rows={4}
+                  style={{ width: '100%', fontFamily: 'inherit', fontSize: 12, resize: 'vertical', boxSizing: 'border-box' }}
+                />
+              </div>
+            </div>
+            )}
+            <div style={{ display: 'flex', gap: 8, marginTop: 20, justifyContent: 'flex-end' }}>
+              <button className="btn btn-secondary" onClick={() => { setShowNewProject(false); setNewProjectMode('link'); setScratchDescription(''); }}>Cancel</button>
+              {newProjectMode === 'link' ? (
+                <button className="btn btn-primary" onClick={createProject}>Create with SUNy</button>
+              ) : (
+                <button
+                  className="btn btn-primary"
+                  style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                  onClick={async () => {
+                    if (!newProjectName.trim() || !newProjectPath.trim()) {
+                      setNewProjectPathError('Please fill in all fields.');
+                      return;
+                    }
+                    const fullPath = newProjectPath.replace(/\\/g, '/') + '/' + newProjectName.trim().replace(/\s+/g, '-').toLowerCase();
+                    await fetch('/api/projects', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      credentials: 'include',
+                      body: JSON.stringify({ name: newProjectName.trim(), local_path: fullPath }),
+                    }).then(async r => {
+                      if (r.ok) {
+                        const created = await r.json();
+                        const loaded = await fetch('/api/projects', { credentials: 'include' }).then(x => x.json());
+                        setProjects(loaded);
+                        const found = loaded.find((p: Project) => p.id === created.id);
+                        if (found) { openProject(found); }
+                        setShowNewProject(false);
+                        setNewProjectMode('link');
+                        const prompt = `Build with SUNy from scratch.\n\nDescription: ${scratchDescription.trim()}\n\nPlease scaffold the folder structure and all necessary files.`;
+                        setScratchDescription('');
+                        setTimeout(() => {
+                          sendPreparedMessage(prompt, { forceWriteMode: true, projectIdOverride: created.id as number });
+                        }, 120);
+                      }
+                    }).catch(() => {});
+                  }}
+                >
+                  <Sparkles size={13} />
+                  Build with SUNy
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Persona Editor Modal */}
+      {showPersonaEditor && activeProject && (
+        <div className="modal-overlay" onClick={() => setShowPersonaEditor(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 520 }}>
+            <h3 className="modal-title">
+              <User size={16} style={{ marginRight: 8, verticalAlign: 'text-bottom' }} />
+              AI Persona — {activeProject.name}
+            </h3>
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12, lineHeight: 1.5 }}>
+              Give SUNy a specific role or personality for this project. This is injected into every conversation.
+              <br />Examples: <em>"Act as a senior Rails engineer. Never suggest Python."</em> or <em>"You are a security-focused code reviewer."</em>
+            </p>
+            <textarea
+              value={personaEditorContent}
+              onChange={e => setPersonaEditorContent(e.target.value)}
+              placeholder="Act as a senior TypeScript engineer focused on clean architecture. Prefer functional patterns. Never use any."
+              rows={6}
+              autoFocus
+              style={{ width: '100%', resize: 'vertical', boxSizing: 'border-box', fontSize: 13 }}
+            />
+            <div style={{ display: 'flex', gap: 8, marginTop: 12, justifyContent: 'flex-end' }}>
+              <button className="btn btn-secondary" onClick={() => setShowPersonaEditor(false)}>Cancel</button>
+              {activeProject.persona && (
+                <button
+                  className="btn btn-secondary"
+                  style={{ color: 'var(--error)', borderColor: 'var(--error)' }}
+                  onClick={() => savePersonaApi('')}
+                >
+                  <Trash2 size={13} style={{ marginRight: 6 }} />Clear
+                </button>
+              )}
+              <button className="btn btn-primary" onClick={() => savePersonaApi(personaEditorContent)}>
+                Save Persona
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Usage Dashboard Modal */}
+      {showUsage && (
+        <div className="modal-overlay" onClick={() => setShowUsage(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 620, maxHeight: '80vh', overflowY: 'auto' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <h3 className="modal-title" style={{ margin: 0 }}>
+                <BarChart2 size={16} style={{ marginRight: 8, verticalAlign: 'text-bottom' }} />
+                Usage Stats
+              </h3>
+              <div style={{ display: 'flex', gap: 6 }}>
+                {[7, 14, 30, 90].map(d => (
+                  <button
+                    key={d}
+                    className={`btn btn-sm ${usageDays === d ? 'btn-primary' : 'btn-secondary'}`}
+                    onClick={() => { setUsageDays(d); loadUsageStats(d); }}
+                  >{d}d</button>
+                ))}
+              </div>
+            </div>
+
+            {/* Totals row */}
+            {usageTotals && (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: 10, marginBottom: 20 }}>
+                {[
+                  { label: 'Total Tokens', value: ((usageTotals.input_tokens + usageTotals.output_tokens) / 1000).toFixed(1) + 'K' },
+                  { label: 'Cache Hits', value: (usageTotals.cache_read_tokens / 1000).toFixed(1) + 'K' },
+                  { label: 'Total Spent', value: '$' + usageTotals.charged_cost.toFixed(4) },
+                  { label: 'Remaining Credits', value: (balance + walletBalance).toFixed(4) },
+                  { label: 'Remaining Session Tokens', value: sessLimit == null ? 'Unlimited' : Math.max(0, sessLimit - sessUsed).toLocaleString() },
+                ].map(({ label, value }) => (
+                  <div key={label} style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: '12px 14px', textAlign: 'center' }}>
+                    <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--accent)' }}>{value}</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>{label}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Daily bar chart (pure CSS) */}
+            {usageByDay.length > 0 && (
+              <div style={{ marginBottom: 20 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Daily Tokens</div>
+                <div style={{ display: 'flex', alignItems: 'flex-end', gap: 3, height: 80, overflow: 'hidden' }}>
+                  {(() => {
+                    const max = Math.max(...usageByDay.map(d => d.input_tokens + d.output_tokens), 1);
+                    return usageByDay.map(d => {
+                      const total = d.input_tokens + d.output_tokens;
+                      const h = Math.max(2, Math.round((total / max) * 76));
+                      return (
+                        <div key={d.day} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }} title={`${d.day}: ${total.toLocaleString()} tokens`}>
+                          <div style={{ width: '100%', height: h, background: 'var(--accent)', borderRadius: '2px 2px 0 0', opacity: 0.8 }} />
+                        </div>
+                      );
+                    });
+                  })()}
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
+                  <span>{usageByDay[0]?.day?.slice(5)}</span>
+                  <span>{usageByDay[usageByDay.length - 1]?.day?.slice(5)}</span>
+                </div>
+              </div>
+            )}
+
+            {/* By mode breakdown */}
+            {usageByMode.length > 0 && (
+              <div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.5px' }}>By Mode</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {usageByMode.map(m => {
+                    const total = m.input_tokens + m.output_tokens;
+                    const maxTotal = Math.max(...usageByMode.map(x => x.input_tokens + x.output_tokens), 1);
+                    const pct = Math.round((total / maxTotal) * 100);
+                    return (
+                      <div key={m.mode}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
+                          <span style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{m.mode}</span>
+                          <span style={{ color: 'var(--text-muted)' }}>{(total / 1000).toFixed(1)}K · ${m.charged_cost.toFixed(4)}</span>
+                        </div>
+                        <div style={{ height: 6, background: 'var(--border)', borderRadius: 3, overflow: 'hidden' }}>
+                          <div style={{ width: `${pct}%`, height: '100%', background: 'var(--accent)', transition: 'width 0.4s' }} />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {usageByDay.length === 0 && usageByMode.length === 0 && (
+              <p style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13, padding: '24px 0' }}>
+                No usage data yet. Start chatting to see stats here!
+              </p>
+            )}
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 20 }}>
+              <button className="btn btn-primary" onClick={() => setShowUsage(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Onboarding Modal */}
+      {showOnboarding && (
+        <div className="modal-overlay">
+          <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
+            <div style={{ textAlign: 'center', padding: '8px 0 16px' }}>
+              <img src="/SLOGO.png" alt="SUNy" style={{ width: 72, height: 72, borderRadius: '50%', objectFit: 'cover', marginBottom: 10, boxShadow: '0 4px 16px rgba(108,99,255,0.3)' }} />
+              <h2 style={{ margin: '0 0 4px', fontSize: 22, fontWeight: 700 }}>Welcome to SUNy!</h2>
+              <p style={{ color: 'var(--text-muted)', fontSize: 13, lineHeight: 1.6, margin: '0 0 20px' }}>
+                Your personal AI assistant — ask anything, build anything. Here's how to start:
+              </p>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 24 }}>
+              {[
+                { icon: '📁', title: 'Create or open a project', desc: 'Click "+ New" in the sidebar to link a folder on your computer or let SUNy create one from scratch.' },
+                { icon: '💬', title: 'Just talk to SUNy', desc: 'Ask questions, get explanations, request changes. SUNy understands what you want and gets it done.' },
+                { icon: '⚡', title: 'Connect the Bridge for full power', desc: 'The Bridge lets SUNy actually write files and run commands on your machine — one terminal command to set up.' },
+              ].map((step, i) => (
+                <div key={i} style={{ display: 'flex', gap: 12, padding: '10px 14px', background: 'var(--bg-secondary)', borderRadius: 8 }}>
+                  <span style={{ fontSize: 20, flexShrink: 0 }}>{step.icon}</span>
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 2 }}>{step.title}</div>
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>{step.desc}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <button className="btn btn-primary" style={{ padding: '9px 24px' }} onClick={dismissOnboarding}>
+                Get Started →
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Help / Shortcuts Modal */}
+      {showHelp && (
+        <div className="modal-overlay" onClick={() => setShowHelp(false)}>
+          <div className="modal" style={{ maxWidth: 540, maxHeight: '80vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <h3 className="modal-title" style={{ margin: 0 }}>
+                <HelpCircle size={16} style={{ marginRight: 8, verticalAlign: 'text-bottom' }} />
+                Help & Shortcuts
+              </h3>
+              <button className="btn btn-icon btn-secondary" onClick={() => setShowHelp(false)}><X size={14} /></button>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+              <section>
+                <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px', color: 'var(--text-muted)', marginBottom: 8 }}>Keyboard Shortcuts</div>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                  <tbody>
+                    {[
+                      ['Enter', 'Send message'],
+                      ['Shift + Enter', 'New line in input'],
+                      ['Esc', 'Stop current AI response'],
+                      ['Ctrl + L', 'Clear current chat'],
+                    ].map(([key, desc]) => (
+                      <tr key={key} style={{ borderBottom: '1px solid var(--border)' }}>
+                        <td style={{ padding: '7px 0', width: '40%' }}>
+                          <code style={{ background: 'var(--bg-secondary)', padding: '2px 6px', borderRadius: 4, fontSize: 11 }}>{key}</code>
+                        </td>
+                        <td style={{ padding: '7px 0', color: 'var(--text-muted)' }}>{desc}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </section>
+
+              <section>
+                <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px', color: 'var(--text-muted)', marginBottom: 8 }}>Features</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {[
+                    { icon: '💬', title: 'Talk / Write mode', desc: 'Toggle between conversational chat (Talk) and file-focused code editing (Write).' },
+                    { icon: '📋', title: 'Project Rules', desc: 'Set persistent instructions SUNy follows in every chat for a project (e.g. "always use TypeScript strict mode").' },
+                    { icon: '🧠', title: 'Memories', desc: 'SUNy remembers key facts about your project automatically.' },
+                    { icon: '🎭', title: 'Persona', desc: 'Give SUNy a custom role for a project — e.g. "You are a security expert".' },
+                    { icon: '🔖', title: 'Checkpoints', desc: 'Save a snapshot of your chat and restore it at any time.' },
+                    { icon: '⚡', title: 'AUTO mode', desc: 'SUNy runs tests and lint in a loop until errors are resolved.' },
+                    { icon: '📁', title: '@file: mentions', desc: 'Type @file:path/to/file.ts in any message to reference a file directly.' },
+                    { icon: '🖥️', title: 'Dev Server', desc: 'Start your project\'s dev server from the sidebar and get a clickable URL.' },
+                  ].map(f => (
+                    <div key={f.title} style={{ display: 'flex', gap: 10 }}>
+                      <span style={{ fontSize: 16, flexShrink: 0 }}>{f.icon}</span>
+                      <div>
+                        <span style={{ fontWeight: 600, fontSize: 12 }}>{f.title}</span>
+                        <span style={{ color: 'var(--text-muted)', fontSize: 12 }}> — {f.desc}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 20 }}>
+              <button className="btn btn-primary" onClick={() => setShowHelp(false)}>Got it</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

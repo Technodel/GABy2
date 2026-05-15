@@ -1,0 +1,794 @@
+import { Router, Request, Response } from 'express';
+import { z } from 'zod';
+import bcrypt from 'bcryptjs';
+import { requireAuth, AuthRequest } from './auth';
+import { getDb } from './db';
+import { hasSufficientBalance, getUserBalance, friendlySessionLimit, deductUsage, transferToWallet } from './billing';
+import { isBridgeConnected, sendToBridge } from './bridge-manager';
+import { userClientManager } from './user-client-manager';
+import { loadProjectRules, saveProjectRules, deleteProjectRules } from './project-rules';
+import { listCheckpoints, rollbackToCheckpoint } from './git-manager';
+import { getBlueprintEntries } from './blueprint-memory';
+
+const router = Router();
+router.use(requireAuth);
+
+// ── Native folder picker (local server only) ────────────────────────────────
+
+router.post('/pick-folder', async (_req: Request, res: Response) => {
+  try {
+    if (process.platform === 'win32') {
+      const { execFile } = await import('child_process');
+      const script = [
+        'Add-Type -AssemblyName System.Windows.Forms',
+        '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog',
+        "$dialog.Description = 'Choose a folder for your project'",
+        '$dialog.ShowNewFolderButton = $true',
+        'if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }',
+      ].join('; ');
+
+      execFile('powershell.exe', ['-NoProfile', '-STA', '-Command', script], { windowsHide: true }, (err, stdout) => {
+        if (err) {
+          res.status(500).json({ error: 'Failed to open folder picker' });
+          return;
+        }
+        const selected = String(stdout || '').trim();
+        if (!selected) {
+          res.status(400).json({ error: 'No folder selected' });
+          return;
+        }
+        res.json({ path: selected });
+      });
+      return;
+    }
+
+    res.status(501).json({ error: 'Native folder picker is currently supported on Windows only. Please type the full path.' });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to pick folder' });
+  }
+});
+
+// ── User profile & balance ─────────────────────────────────────────────────────
+
+router.get('/me', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const db = getDb();
+  const row = db.prepare(`
+    SELECT id, username, display_name, balance, wallet_balance, wallet_auto_spend, selected_mode, max_tokens_per_session, is_active
+    FROM users WHERE id = ?
+  `).get(user.id) as UserRow | undefined;
+
+  if (!row) { res.status(404).json({ error: 'User not found' }); return; }
+
+  const pricing = db.prepare('SELECT * FROM pricing_modes ORDER BY id').all();
+  const settings = getDb().prepare('SELECT key, value FROM app_settings').all() as { key: string; value: string }[];
+  const settingsMap: Record<string, string> = {};
+  for (const s of settings) settingsMap[s.key] = s.value;
+  const getUserSetting = (key: string, fallback: string) => {
+    const scoped = settingsMap[`user_${user.id}_${key}`];
+    if (scoped !== undefined) return scoped;
+    return settingsMap[key] ?? fallback;
+  };
+
+  res.json({
+    id: row.id,
+    username: row.username,
+    display_name: row.display_name ?? null,
+    balance: row.balance,
+    wallet_balance: row.wallet_balance,
+    wallet_auto_spend: row.wallet_auto_spend === 1,
+    selected_mode: row.selected_mode,
+    max_tokens_per_session: row.max_tokens_per_session,
+    session_limit_label: friendlySessionLimit(row.max_tokens_per_session),
+    is_active: row.is_active === 1,
+    auto_approve: getUserSetting('auto_approve', 'true') === 'true',
+    memory_enabled: getUserSetting('memory_enabled', 'true') === 'true',
+    cross_device_memory_enabled: getUserSetting('cross_device_memory_enabled', 'false') === 'true',
+    chat_show_technical_details: getUserSetting('chat_show_technical_details', 'false') === 'true',
+    modes: (() => {
+      const list = (pricing as PricingRow[]).map(p => {
+        const keyCount = (db.prepare('SELECT COUNT(*) as cnt FROM api_keys WHERE mode = ? AND is_active = 1').get(p.mode) as { cnt: number }).cnt;
+        return {
+          mode: p.mode,
+          display_name: p.display_name,
+          description: p.description ?? '',
+          // Never expose formula, token costs, or max_tokens as raw numbers
+          session_limit_label: friendlySessionLimit(p.global_max_tokens),
+          has_active_key: keyCount > 0,
+        };
+      });
+      // AUTO mode: virtual entry — routes to the best real mode per message
+      list.push({
+        mode: 'auto',
+        display_name: '🤖 Auto',
+        description: 'Smartly picks the right model for each message — fast for code, powerful for analysis',
+        session_limit_label: 'Adaptive',
+        has_active_key: list.some(m => m.has_active_key),
+      });
+      return list;
+    })(),
+    bridge_connected: isBridgeConnected(user.id as number),
+  });
+});
+
+// ── Update display name ────────────────────────────────────────────────────────────────────────
+
+router.patch('/me/name', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const raw = (req.body as { display_name?: unknown }).display_name;
+  const name = typeof raw === 'string' ? raw.trim().slice(0, 50) || null : null;
+  getDb().prepare('UPDATE users SET display_name = ? WHERE id = ?').run(name, user.id);
+  res.json({ success: true });
+});
+
+router.patch('/me/mode', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const schema = z.object({ mode: z.enum(['free', 'fast', 'pro', 'auto']) });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: 'Invalid mode' }); return; }
+  getDb().prepare('UPDATE users SET selected_mode = ? WHERE id = ?').run(parsed.data.mode, user.id);
+  res.json({ success: true });
+});
+
+// ── Projects ───────────────────────────────────────────────────────────────────
+
+router.get('/projects', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const projects = getDb().prepare('SELECT id, name, local_path, persona, created_at FROM projects WHERE user_id = ?').all(user.id);
+  res.json(projects);
+});
+
+router.get('/projects/spend', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const rows = getDb().prepare(`
+    SELECT
+      p.id as project_id,
+      p.name,
+      COALESCE(SUM(u.input_tokens + u.output_tokens), 0) as total_tokens,
+      COALESCE(SUM(u.charged_cost), 0) as total_cost
+    FROM projects p
+    LEFT JOIN usage_log u ON u.project_id = p.id AND u.user_id = p.user_id
+    WHERE p.user_id = ?
+    GROUP BY p.id, p.name
+    ORDER BY total_cost DESC, p.created_at DESC
+  `).all(user.id) as { project_id: number; name: string; total_tokens: number; total_cost: number }[];
+  res.json(rows);
+});
+
+function isAbsolutePath(p: string): boolean {
+  // Windows: starts with drive letter e.g. C:\ or C:/
+  // Windows UNC: \\server\share
+  // Unix: starts with /
+  return /^[A-Za-z]:[\\//]/.test(p) || /^\\\\/.test(p) || p.startsWith('/');
+}
+
+const CreateProjectSchema = z.object({
+  name: z.string().min(1).max(100),
+  local_path: z.string().min(1).max(500).refine(
+    isAbsolutePath,
+    { message: 'Please enter the full path to your project folder, like D:\\Projects\\MyApp' }
+  ),
+});
+
+router.post('/projects', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const parsed = CreateProjectSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
+    return;
+  }
+  const result = getDb().prepare('INSERT INTO projects (user_id, name, local_path) VALUES (?, ?, ?)').run(
+    user.id, parsed.data.name, parsed.data.local_path
+  );
+  res.json({ success: true, id: result.lastInsertRowid });
+});
+
+router.delete('/projects/:id', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) { res.status(400).json({ error: 'Invalid id' }); return; }
+  getDb().prepare('DELETE FROM projects WHERE id = ? AND user_id = ?').run(id, user.id);
+  res.json({ success: true });
+});
+
+/** Set or clear the AI persona for a project */
+router.patch('/projects/:id/persona', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) { res.status(400).json({ error: 'Invalid id' }); return; }
+  const parsed = z.object({ persona: z.string().max(2000).nullable() }).safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: 'Invalid input' }); return; }
+  const proj = getDb().prepare('SELECT id FROM projects WHERE id = ? AND user_id = ?').get(id, user.id);
+  if (!proj) { res.status(404).json({ error: 'Project not found' }); return; }
+  getDb().prepare('UPDATE projects SET persona = ? WHERE id = ?').run(parsed.data.persona?.trim() || null, id);
+  res.json({ success: true });
+});
+
+// ── Memories ───────────────────────────────────────────────────────────────────
+
+router.get('/memories', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const memories = getDb().prepare(`
+    SELECT id, content, created_at FROM user_memories WHERE user_id = ? ORDER BY created_at DESC
+  `).all(user.id);
+  res.json(memories);
+});
+
+const AddMemorySchema = z.object({
+  content: z.string().min(1).max(500),
+});
+
+router.post('/memories', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const parsed = AddMemorySchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: 'Invalid input' }); return; }
+  const result = getDb().prepare('INSERT INTO user_memories (user_id, content) VALUES (?, ?)').run(user.id, parsed.data.content);
+  res.json({ success: true, id: result.lastInsertRowid });
+});
+
+router.delete('/memories/:id', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) { res.status(400).json({ error: 'Invalid id' }); return; }
+  getDb().prepare('DELETE FROM user_memories WHERE id = ? AND user_id = ?').run(id, user.id);
+  res.json({ success: true });
+});
+
+router.delete('/memories', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  getDb().prepare('DELETE FROM user_memories WHERE user_id = ?').run(user.id);
+  res.json({ success: true });
+});
+
+// ── User settings ──────────────────────────────────────────────────────────────
+
+const UserSettingsSchema = z.object({
+  dark_mode: z.boolean().optional(),
+  auto_approve: z.boolean().optional(),
+  memory_enabled: z.boolean().optional(),
+  cross_device_memory_enabled: z.boolean().optional(),
+  chat_show_technical_details: z.boolean().optional(),
+  auto_backup_enabled: z.boolean().optional(),
+  auto_backup_trigger: z.enum(['task', 'tokens', 'minutes']).optional(),
+  auto_backup_interval: z.number().int().min(1).optional(),
+  max_tokens_per_session: z.number().int().positive().nullable().optional(),
+});
+
+router.patch('/settings', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const parsed = UserSettingsSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: 'Invalid input' }); return; }
+  const db = getDb();
+  const update = db.prepare('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)');
+  for (const [key, val] of Object.entries(parsed.data)) {
+    if (val !== undefined && key !== 'max_tokens_per_session') {
+      update.run(`user_${user.id}_${key}`, String(val));
+    }
+  }
+  // max_tokens_per_session lives on the users table
+  if (parsed.data.max_tokens_per_session !== undefined) {
+    db.prepare('UPDATE users SET max_tokens_per_session = ? WHERE id = ?')
+      .run(parsed.data.max_tokens_per_session, user.id);
+  }
+  res.json({ success: true });
+});
+
+// ── Change password ────────────────────────────────────────────────────────────
+
+const ChangePasswordSchema = z.object({
+  current_password: z.string().min(1),
+  new_password: z.string().min(6).max(100),
+});
+
+router.post('/change-password', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const parsed = ChangePasswordSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: 'New password must be at least 6 characters.' }); return; }
+  const db = getDb();
+  const row = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(user.id) as { password_hash: string } | undefined;
+  if (!row) { res.status(404).json({ error: 'User not found' }); return; }
+  if (!bcrypt.compareSync(parsed.data.current_password, row.password_hash)) {
+    res.status(400).json({ error: 'Current password is incorrect.' }); return;
+  }
+  const newHash = bcrypt.hashSync(parsed.data.new_password, 12);
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, user.id);
+  res.json({ success: true });
+});
+
+// ── Public contact info (for Contact Us page) ──────────────────────────────────
+
+router.get('/contact', (_req: Request, res: Response) => {
+  const info = getDb().prepare('SELECT phone, email, website, whatsapp, support_message FROM contact_info WHERE id = 1').get();
+  res.json(info || {});
+});
+
+// ── Public pricing (for landing page, no auth required) ───────────────────────
+
+router.get('/pricing-public', (_req: Request, res: Response) => {
+  const modes = getDb().prepare(
+    'SELECT mode, display_name, description, input_token_base_cost, output_token_base_cost FROM pricing_modes ORDER BY id'
+  ).all();
+  res.json(modes);
+});
+
+// ── Balance check ──────────────────────────────────────────────────────────────
+
+router.get('/balance', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const balance = getUserBalance(user.id as number);
+  res.json({ balance });
+});
+
+interface UserRow {
+  id: number;
+  username: string;
+  display_name: string | null;
+  balance: number;
+  wallet_balance: number;
+  wallet_auto_spend: number;
+  selected_mode: string;
+  max_tokens_per_session: number | null;
+  is_active: number;
+}
+
+interface PricingRow {
+  mode: string;
+  display_name: string;
+  description: string;
+  global_max_tokens: number | null;
+}
+
+// ── Bridge token (for BridgeSetup page) ───────────────────────────────────────
+// Returns the same JWT already in the cookie so the bridge CLI can use it.
+// Since it's httpOnly, the frontend can't read the cookie directly.
+router.get('/bridge-token', (req: Request, res: Response) => {
+  const token = req.cookies?.suny_token;
+  if (!token) { res.status(401).json({ error: 'Not authenticated' }); return; }
+  res.json({ token });
+});
+
+// ── Launch a local terminal with the bridge install command pre-loaded ─────────
+// Only works when the server is running on the user's own machine.
+router.post('/bridge/launch-terminal', async (req: Request, res: Response) => {
+  const token = req.cookies?.suny_token;
+  if (!token) { res.status(401).json({ error: 'Not authenticated' }); return; }
+
+  const { spawn } = await import('child_process');
+  const { writeFileSync } = await import('fs');
+  const { join } = await import('path');
+  const { tmpdir } = await import('os');
+
+  const wsProto = req.secure ? 'wss' : 'ws';
+  const host = req.headers.host || 'localhost:3500';
+  const serverUrl = `${wsProto}://${host}`;
+  const tgzUrl = `${req.protocol}://${host}/bridge/suny-bridge.tgz`;
+  const installCmd = `npm install -g ${tgzUrl}`;
+  const startCmd = `suny-bridge start --token ${token} --server ${serverUrl}`;
+  const cmd = `${installCmd} && ${startCmd}`;
+
+  try {
+    if (process.platform === 'win32') {
+      // Write a temp .ps1 script that shows the command and runs it on Enter
+      const scriptPath = join(tmpdir(), 'suny-bridge-setup.ps1');
+      const psScript = `$Host.UI.RawUI.WindowTitle = 'SUNy Bridge Setup'
+Write-Host ''
+Write-Host '  ===============================' -ForegroundColor Cyan
+Write-Host '   SUNy Bridge Setup' -ForegroundColor Cyan
+Write-Host '  ===============================' -ForegroundColor Cyan
+Write-Host ''
+Write-Host '  The following commands will run:' -ForegroundColor Gray
+Write-Host ''
+Write-Host '  1) ${installCmd}' -ForegroundColor Yellow
+Write-Host '  2) ${startCmd}' -ForegroundColor Yellow
+Write-Host ''
+Write-Host '  (Ctrl+C to cancel)' -ForegroundColor DarkGray
+Write-Host ''
+Read-Host '  [ Press Enter to run ]'
+Write-Host ''
+Write-Host '  Installing...' -ForegroundColor Cyan
+Invoke-Expression ${JSON.stringify(installCmd)}
+if ($LASTEXITCODE -eq 0) {
+  Write-Host ''
+  Write-Host '  Starting bridge...' -ForegroundColor Cyan
+  Invoke-Expression ${JSON.stringify(startCmd)}
+}
+Write-Host ''
+Write-Host '  Done! The bridge is now running. You can close this window.' -ForegroundColor Green
+Read-Host '  [ Press Enter to exit ]'
+`;
+      writeFileSync(scriptPath, psScript, 'utf8');
+      // cmd /c start opens a new visible window reliably on Windows
+      const { exec } = await import('child_process');
+      exec(`start powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${scriptPath}"`, { shell: true });
+    } else if (process.platform === 'darwin') {
+      // macOS: open Terminal.app, show command, run on Enter
+      const shScript = `echo ''; echo '  =============================='; echo '   SUNy Bridge Setup'; echo '  =============================='; echo ''; echo '  Command to run:'; echo ''; echo '  ${cmd.replace(/'/g, "'\\''")}'; echo ''; read -p '  Press Enter to run (Ctrl+C to cancel)... '; echo ''; ${cmd}; echo ''; echo '  Done! Bridge is running.'; exec bash`;
+      const applescript = `tell application "Terminal"\n  activate\n  do script ${JSON.stringify(shScript)}\nend tell`;
+      spawn('osascript', ['-e', applescript], { detached: true, stdio: 'ignore' }).unref();
+    } else {
+      // Linux: try common terminal emulators
+      const shScript = `echo ''; echo '  SUNy Bridge Setup'; echo ''; echo "  ${cmd.replace(/"/g, '\\"')}"; echo ''; read -p '  Press Enter to run (Ctrl+C to cancel)... '; ${cmd}; echo ''; echo 'Done! Press Enter to exit.'; read`;
+      const terminals: [string, string[]][] = [
+        ['gnome-terminal', ['--', 'bash', '-c', shScript]],
+        ['konsole', ['-e', 'bash', '-c', shScript]],
+        ['xterm', ['-e', 'bash', '-c', shScript]],
+        ['x-terminal-emulator', ['-e', `bash -c ${JSON.stringify(shScript)}`]],
+      ];
+      let launched = false;
+      for (const [term, args] of terminals) {
+        try {
+          spawn(term, args, { detached: true, stdio: 'ignore' }).unref();
+          launched = true;
+          break;
+        } catch { /* try next */ }
+      }
+      if (!launched) { res.status(501).json({ error: 'No supported terminal emulator found' }); return; }
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to launch terminal' });
+  }
+});
+
+// ── Wallet ─────────────────────────────────────────────────────────────────────
+
+const TransferSchema = z.object({
+  amount: z.number().positive(),
+});
+
+/** Transfer credits → wallet (bot fuel tank). */
+router.post('/wallet/transfer', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const parsed = TransferSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: 'Invalid amount' }); return; }
+  try {
+    const result = transferToWallet(user.id as number, parsed.data.amount);
+    // Push both updated balances to the browser tab
+    userClientManager.pushToUser(user.id as number, 'suny:balance', {
+      balance: result.newBalance,
+      wallet_balance: result.newWalletBalance,
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Transfer failed' });
+  }
+});
+
+/** Toggle wallet auto-spend (drain main balance when wallet is empty). */
+router.patch('/wallet/auto-spend', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const parsed = z.object({ enabled: z.boolean() }).safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: 'Invalid input' }); return; }
+  getDb().prepare('UPDATE users SET wallet_auto_spend = ? WHERE id = ?')
+    .run(parsed.data.enabled ? 1 : 0, user.id);
+  res.json({ success: true });
+});
+
+// ── Project Rules (.suny-rules) ─────────────────────────────────────────────
+
+/** Get rules for a project (returns null if none set) */
+router.get('/projects/:id/rules', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const projectId = parseInt(req.params.id, 10);
+  if (isNaN(projectId)) { res.status(400).json({ error: 'Invalid project id' }); return; }
+  const proj = getDb().prepare('SELECT local_path FROM projects WHERE id = ? AND user_id = ?')
+    .get(projectId, user.id) as { local_path: string } | undefined;
+  if (!proj) { res.status(404).json({ error: 'Project not found' }); return; }
+  const rules = loadProjectRules(proj.local_path);
+  res.json({ rules });
+});
+
+/** Save or update rules for a project */
+router.put('/projects/:id/rules', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const projectId = parseInt(req.params.id, 10);
+  if (isNaN(projectId)) { res.status(400).json({ error: 'Invalid project id' }); return; }
+  const parsed = z.object({ content: z.string().max(8192) }).safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: 'Invalid input' }); return; }
+  const proj = getDb().prepare('SELECT local_path FROM projects WHERE id = ? AND user_id = ?')
+    .get(projectId, user.id) as { local_path: string } | undefined;
+  if (!proj) { res.status(404).json({ error: 'Project not found' }); return; }
+  try {
+    saveProjectRules(proj.local_path, parsed.data.content);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to save rules' });
+  }
+});
+
+/** Delete rules for a project */
+router.delete('/projects/:id/rules', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const projectId = parseInt(req.params.id, 10);
+  if (isNaN(projectId)) { res.status(400).json({ error: 'Invalid project id' }); return; }
+  const proj = getDb().prepare('SELECT local_path FROM projects WHERE id = ? AND user_id = ?')
+    .get(projectId, user.id) as { local_path: string } | undefined;
+  if (!proj) { res.status(404).json({ error: 'Project not found' }); return; }
+  deleteProjectRules(proj.local_path);
+  res.json({ success: true });
+});
+
+// ── Usage Stats ──────────────────────────────────────────────────────────────
+
+/** Return daily + mode-level token/cost summary for the authenticated user */
+router.get('/me/usage', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const days = Math.min(90, Math.max(1, parseInt((req.query.days as string) || '30', 10)));
+  const db = getDb();
+  const byDay = db.prepare(`
+    SELECT date(timestamp) as day,
+           SUM(input_tokens)       as input_tokens,
+           SUM(output_tokens)      as output_tokens,
+           SUM(cache_read_tokens)  as cache_read_tokens,
+           SUM(charged_cost)       as charged_cost
+    FROM usage_log
+    WHERE user_id = ? AND timestamp >= date('now', '-' || ? || ' days')
+    GROUP BY day ORDER BY day ASC
+  `).all(user.id, days) as { day: string; input_tokens: number; output_tokens: number; cache_read_tokens: number; charged_cost: number }[];
+
+  const byMode = db.prepare(`
+    SELECT mode,
+           SUM(input_tokens)  as input_tokens,
+           SUM(output_tokens) as output_tokens,
+           SUM(charged_cost)  as charged_cost
+    FROM usage_log WHERE user_id = ?
+    GROUP BY mode ORDER BY charged_cost DESC
+  `).all(user.id) as { mode: string; input_tokens: number; output_tokens: number; charged_cost: number }[];
+
+  const totals = db.prepare(`
+    SELECT COALESCE(SUM(input_tokens),0)      as input_tokens,
+           COALESCE(SUM(output_tokens),0)     as output_tokens,
+           COALESCE(SUM(cache_read_tokens),0) as cache_read_tokens,
+           COALESCE(SUM(charged_cost),0)      as charged_cost
+    FROM usage_log WHERE user_id = ?
+  `).get(user.id) as { input_tokens: number; output_tokens: number; cache_read_tokens: number; charged_cost: number };
+
+  res.json({ by_day: byDay, by_mode: byMode, totals });
+});
+
+// ── Checkpoints ───────────────────────────────────────────────────────────────
+
+/** List recent checkpoint commits for a project */
+router.get('/projects/:id/checkpoints', async (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const projectId = parseInt(req.params.id, 10);
+  if (isNaN(projectId)) { res.status(400).json({ error: 'Invalid project id' }); return; }
+  const proj = getDb().prepare('SELECT local_path FROM projects WHERE id = ? AND user_id = ?')
+    .get(projectId, user.id) as { local_path: string } | undefined;
+  if (!proj) { res.status(404).json({ error: 'Project not found' }); return; }
+  try {
+    const checkpoints = await listCheckpoints(user.id as number, proj.local_path);
+    res.json({ checkpoints });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to list checkpoints' });
+  }
+});
+
+// ── Cross-device project state (chat + memories) ───────────────────────────
+
+const MessageReportSchema = z.object({
+  durationMs: z.number().int().nonnegative(),
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  cacheWriteTokens: z.number().int().nonnegative(),
+  cacheReadTokens: z.number().int().nonnegative(),
+  totalTokens: z.number().int().nonnegative(),
+  rawCost: z.number().nonnegative(),
+  chargedCost: z.number().nonnegative(),
+  humanEstimateMinutes: z.number().int().nonnegative(),
+  humanEstimateCost: z.number().nonnegative(),
+});
+
+router.get('/projects/:id/state', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const projectId = parseInt(req.params.id, 10);
+  if (isNaN(projectId)) { res.status(400).json({ error: 'Invalid project id' }); return; }
+
+  const db = getDb();
+  const proj = db.prepare('SELECT id FROM projects WHERE id = ? AND user_id = ?').get(projectId, user.id);
+  if (!proj) { res.status(404).json({ error: 'Project not found' }); return; }
+
+  const row = db.prepare(`
+    SELECT messages_json, memories_json, updated_at
+    FROM user_project_state
+    WHERE user_id = ? AND project_id = ?
+  `).get(user.id, projectId) as { messages_json: string; memories_json: string; updated_at: string } | undefined;
+
+  if (!row) {
+    res.json({ messages: [], memories: [], updated_at: null });
+    return;
+  }
+
+  let messages: unknown[] = [];
+  let memories: unknown[] = [];
+  try { messages = JSON.parse(row.messages_json || '[]'); } catch { messages = []; }
+  try { memories = JSON.parse(row.memories_json || '[]'); } catch { memories = []; }
+
+  res.json({
+    messages: Array.isArray(messages) ? messages : [],
+    memories: Array.isArray(memories) ? memories : [],
+    updated_at: row.updated_at,
+  });
+});
+
+const ProjectStateSchema = z.object({
+  messages: z.array(z.object({
+    id: z.number(),
+    type: z.enum(['user', 'suny', 'system']),
+    content: z.string().max(20000),
+    timestamp: z.number().int().nonnegative().optional(),
+    report: MessageReportSchema.optional(),
+  })).max(200),
+  memories: z.array(z.object({
+    id: z.string().max(80),
+    projectId: z.number(),
+    title: z.string().max(200),
+    summary: z.string().max(4000),
+    createdAt: z.number(),
+    updatedAt: z.number(),
+  })).max(500),
+});
+
+router.put('/projects/:id/state', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const projectId = parseInt(req.params.id, 10);
+  if (isNaN(projectId)) { res.status(400).json({ error: 'Invalid project id' }); return; }
+
+  const parsed = ProjectStateSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: 'Invalid state payload' }); return; }
+
+  const db = getDb();
+  const proj = db.prepare('SELECT id FROM projects WHERE id = ? AND user_id = ?').get(projectId, user.id);
+  if (!proj) { res.status(404).json({ error: 'Project not found' }); return; }
+
+  db.prepare(`
+    INSERT INTO user_project_state (user_id, project_id, messages_json, memories_json, updated_at)
+    VALUES (?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(user_id, project_id)
+    DO UPDATE SET messages_json = excluded.messages_json,
+                  memories_json = excluded.memories_json,
+                  updated_at = datetime('now')
+  `).run(
+    user.id,
+    projectId,
+    JSON.stringify(parsed.data.messages),
+    JSON.stringify(parsed.data.memories),
+  );
+
+  res.json({ success: true });
+});
+
+/** Roll back a project to a checkpoint by SHA */
+router.post('/projects/:id/checkpoints/rollback', async (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const projectId = parseInt(req.params.id, 10);
+  if (isNaN(projectId)) { res.status(400).json({ error: 'Invalid project id' }); return; }
+  const parsed = z.object({ sha: z.string().regex(/^[0-9a-f]{7,40}$/i) }).safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: 'Invalid SHA' }); return; }
+  const proj = getDb().prepare('SELECT local_path FROM projects WHERE id = ? AND user_id = ?')
+    .get(projectId, user.id) as { local_path: string } | undefined;
+  if (!proj) { res.status(404).json({ error: 'Project not found' }); return; }
+  try {
+    await rollbackToCheckpoint(user.id as number, proj.local_path, parsed.data.sha);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Rollback failed' });
+  }
+});
+
+// ── File browser ──────────────────────────────────────────────────────────────
+
+/** Return a shallow 2-level file tree for a project via the bridge */
+router.get('/projects/:id/files', async (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const projectId = parseInt(req.params.id, 10);
+  if (isNaN(projectId)) { res.status(400).json({ error: 'Invalid project id' }); return; }
+  const proj = getDb().prepare('SELECT local_path FROM projects WHERE id = ? AND user_id = ?')
+    .get(projectId, user.id) as { local_path: string } | undefined;
+  if (!proj) { res.status(404).json({ error: 'Project not found' }); return; }
+  if (!isBridgeConnected(user.id as number)) { res.status(503).json({ error: 'Bridge not connected' }); return; }
+  try {
+    const raw = await sendToBridge(user.id as number, 'exec:shell', {
+      command: `node -e "
+        const fs=require('fs'),path=require('path');
+        const root=${JSON.stringify(proj.local_path)};
+        const IGNORE=new Set(['node_modules','.git','dist','build','.next','__pycache__','.venv','venv']);
+        function tree(dir,depth){
+          if(depth>2)return[];
+          let entries=[];
+          try{entries=fs.readdirSync(dir,{withFileTypes:true});}catch{return[];}
+          return entries.filter(e=>!IGNORE.has(e.name)&&!e.name.startsWith('.')).map(e=>{
+            const p=path.join(dir,e.name);
+            const rel=path.relative(root,p).replace(/\\\\/g,'/');
+            const node={name:e.name,path:rel,isDir:e.isDirectory()};
+            if(e.isDirectory()&&depth<2)node.children=tree(p,depth+1);
+            return node;
+          });
+        }
+        process.stdout.write(JSON.stringify(tree(root,1)));
+      "`,
+      cwd: proj.local_path,
+      requiresConfirmation: false,
+    }, 10000) as string;
+    try { res.json(JSON.parse(raw.trim())); } catch { res.json([]); }
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to list files' });
+  }
+});
+
+// ── Dev server ─────────────────────────────────────────────────────────────────
+
+// In-memory map: userId → { pid, url }
+const devServers = new Map<number, { url: string }>();
+
+/** Start the project's dev server (npm run dev / vite / python server) */
+router.post('/projects/:id/dev-server/start', async (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const projectId = parseInt(req.params.id, 10);
+  if (isNaN(projectId)) { res.status(400).json({ error: 'Invalid project id' }); return; }
+  const proj = getDb().prepare('SELECT local_path FROM projects WHERE id = ? AND user_id = ?')
+    .get(projectId, user.id) as { local_path: string } | undefined;
+  if (!proj) { res.status(404).json({ error: 'Project not found' }); return; }
+  if (!isBridgeConnected(user.id as number)) { res.status(503).json({ error: 'Bridge not connected' }); return; }
+
+  // Detect what starter command to use
+  const fs = await import('fs');
+  const path = await import('path');
+  const pkgPath = path.join(proj.local_path, 'package.json');
+  let startCmd = 'python3 -m http.server 8080';
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    if (pkg.scripts?.dev) startCmd = 'npm run dev';
+    else if (pkg.scripts?.start) startCmd = 'npm start';
+    else if (pkg.scripts?.serve) startCmd = 'npm run serve';
+  } catch { /* no package.json — use python fallback */ }
+
+  try {
+    // Fire-and-forget: bridge runs the process detached
+    sendToBridge(user.id as number, 'exec:shell', {
+      command: startCmd,
+      cwd: proj.local_path,
+      requiresConfirmation: false,
+      detached: true,
+    }, 5000).catch(() => {});
+
+    // Optimistically return URL (most vite/CRA apps default to 5173/3000)
+    const guessedPort = startCmd.includes('vite') || startCmd.includes('dev') ? 5173 : 3000;
+    const url = `http://localhost:${guessedPort}`;
+    devServers.set(user.id as number, { url });
+    res.json({ url, command: startCmd });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to start dev server' });
+  }
+});
+
+/** Stop the project's dev server */
+router.post('/projects/:id/dev-server/stop', async (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  devServers.delete(user.id as number);
+  // Best-effort: kill any node/vite/python dev server processes via bridge
+  if (isBridgeConnected(user.id as number)) {
+    sendToBridge(user.id as number, 'exec:shell', {
+      command: process.platform === 'win32'
+        ? 'taskkill /F /IM node.exe /T 2>nul & taskkill /F /IM python3.exe /T 2>nul & exit 0'
+        : 'pkill -f "vite|npm run dev|http.server" 2>/dev/null; exit 0',
+      requiresConfirmation: false,
+    }, 5000).catch(() => {});
+  }
+  res.json({ success: true });
+});
+
+// ── Blueprint Memory Graph ────────────────────────────────────────────────────
+
+/** Return the design-decision timeline for a project */
+router.get('/projects/:id/blueprint', (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const projectId = parseInt(req.params.id, 10);
+  if (isNaN(projectId)) { res.status(400).json({ error: 'Invalid project id' }); return; }
+  const proj = getDb().prepare('SELECT id FROM projects WHERE id = ? AND user_id = ?').get(projectId, user.id);
+  if (!proj) { res.status(404).json({ error: 'Project not found' }); return; }
+  const entries = getBlueprintEntries({ userId: user.id as number, projectId, limit: 50 });
+  res.json({ entries });
+});
+
+export default router;

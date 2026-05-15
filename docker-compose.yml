@@ -1,0 +1,28 @@
+version: '3.9'
+
+services:
+  suny:
+    build: .
+    container_name: suny
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - suny_data:/data
+    environment:
+      - NODE_ENV=production
+      - SUNY_PORT=3000
+      - SUNY_DB_PATH=/data/suny.db
+      - SUNY_SECRET_JWT=${SUNY_SECRET_JWT}
+      - SUNY_ADMIN_PASSWORD=${SUNY_ADMIN_PASSWORD}
+      - SUNY_ALLOWED_ORIGIN=${SUNY_ALLOWED_ORIGIN}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  suny_data:
+    driver: local
