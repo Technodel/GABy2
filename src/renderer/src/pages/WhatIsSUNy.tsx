@@ -19,7 +19,9 @@ const useCases = [
 const visibleWins = [
   { title: 'One-Click Ship Mode', text: 'You describe the goal once. SUNy handles planning, edits, checks, and delivery in one guided flow.' },
   { title: '🧠 Code Conscience Alerts', text: 'SUNy notifies you whenever a change drifts from stated intent — before it reaches your codebase. Design memory is always active.' },
+  { title: '🎯 Persistent Goal Tracking', text: 'Active goals survive across sessions with success criteria and evidence collection. SUNy picks up exactly where it left off.' },
   { title: 'Time-Stamped Chat + Reports', text: 'Every chat turn is timestamped to the second, and every SUNy answer can open a compact report with time spent, tokens, cost, and a human-time estimate.' },
+  { title: '📈 Confidence Dashboard', text: 'SUNy self-reports uncertainty on every turn. Low confidence automatically escalates to a stronger model. You always know how sure it is.' },
   { title: 'Proof Panel', text: 'Every run ends with evidence: changed files, checks executed, outcomes, and fixes applied.' },
   { title: 'Live Execution Timeline', text: 'You can watch each stage happen in real time: plan, edit, test, fix, done.' },
   { title: 'Checkpoint Rollback', text: 'Each turn creates a restore point so you can return to any earlier working version instantly.' },
@@ -28,6 +30,9 @@ const visibleWins = [
 const coreWins = [
   { title: 'Adaptive Intelligence Routing', text: 'SUNy routes easy work to low-latency paths and complex tasks to deeper reasoning paths for better throughput and quality.' },
   { title: 'Verification-First Engine', text: 'SUNy validates output with linting, tests, and targeted correction loops before finalizing answers.' },
+  { title: '🎯 Multi-Horizon Goal Stack', text: 'Persistent goal tracking with success criteria, evidence collection, attempt counting, and auto-completion when all criteria are met. Survives restarts.' },
+  { title: '🔀 Parallel Hypothesis Engine', text: 'For complex problems, SUNy spawns 2-3 mini-agents with different strategies (direct edit, refactor first, test first) and selects the best result.' },
+  { title: '📊 Task Dependency Graph', text: 'DAG-based task decomposition — SUNy understands what must be done before what, works leaves first, and rolls up to the root goal.' },
   { title: '🔮 SUNy Code Conscience — Design Memory', text: 'SUNy remembers every design decision across sessions. Blueprint entries persist intent, architecture choices, and outcomes so every turn compounds knowledge.' },
   { title: '🛡️ SUNy Code Conscience — Change Guardian', text: 'An intent-aware guardian that snapshots TypeScript signatures before changes and detects semantic drift automatically — catching unintended contract breaks before they ship.' },
   { title: 'Repository Memory Graph', text: 'SUNy keeps long-lived project memory about structure, style, and decisions to reduce re-discovery and drift.' },

@@ -88,11 +88,14 @@ function EnglishContent() {
       <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 16 }}>What can SUNy do for you?</h2>
 
       {[
-        { icon: 'GOAL', title: 'You give the goal. SUNy does the rest.', desc: 'Just tell SUNy what you want and it takes it from there. No commands, no code to copy-paste, no guesswork.' },
+        { icon: 'GOAL', title: '🎯 Persistent Goal Tracking', desc: 'SUNy remembers what it was working on across sessions. Active goals persist with success criteria and evidence collection. Pick up exactly where you left off.' },
         { icon: 'READ', title: 'It reads your entire project', desc: 'SUNy explores your project automatically to understand how everything fits together before touching a single file.' },
         { icon: 'EDIT', title: 'It writes, edits & creates files', desc: 'SUNy can create new files, modify existing ones, and organize your project -- all without you lifting a finger.' },
         { icon: 'AUTO', title: 'It handles the hard stuff automatically', desc: 'SUNy runs everything behind the scenes while keeping you in the loop with friendly, plain-English updates.' },
         { icon: 'LOOP', title: 'It does not give up', desc: 'If something does not work the first time, SUNy tries a different approach. It keeps going until it gets it right.' },
+        { icon: 'DIAG', title: '🔀 Parallel Hypothesis Testing', desc: 'For tough problems, SUNy spawns multiple mini-agents with different strategies simultaneously and picks the best result.' },
+        { icon: 'DAG', title: '📊 Task Dependency Graph', desc: 'Complex tasks are decomposed into dependency-ordered steps. SUNy works the graph -- unblocks nodes, completes leaves first, rolls up to the goal.' },
+        { icon: 'CONF', title: '📈 Confidence Scoring', desc: 'SUNy self-reports uncertainty on every turn. Low confidence triggers automatic escalation to a stronger model.' },
         { icon: 'PROJ', title: 'Multiple Projects', desc: 'Work on as many projects as you need. SUNy keeps everything organized and separate.' },
         { icon: 'MEM', title: 'It gets smarter the more you use it', desc: 'SUNy remembers your preferences, your project style, and your past decisions -- so every session feels familiar.' },
         { icon: 'LANG', title: 'Plain English, always', desc: 'No tech jargon. SUNy explains what it is doing in a way that actually makes sense.' },
@@ -185,11 +188,14 @@ function ArabicContent() {
       <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 16 }}>ماذا يمكن لـ SUNy ان يفعل من اجلك؟</h2>
 
       {[
-        { icon: 'GOAL', title: 'انت تحدد الهدف. SUNy يتكفل بالباقي.', desc: 'فقط اخبر SUNy بما تريد وSUNy يتولى الامر من هناك. لا اوامر، لا نسخ ولصق، لا تخمين.' },
+        { icon: 'GOAL', title: '🎯 تتبع الاهداف المستمر', desc: 'SUNy يتذكر ما كان يعمل عليه عبر الجلسات. الاهداف النشطة تحتفظ بمعايير النجاح والادلة. استمر من حيث توقفت.' },
         { icon: 'READ', title: 'يقرا مشروعك بالكامل', desc: 'يستكشف SUNy مشروعك تلقائيا ويفهم كيف يرتبط كل شيء ببعضه قبل ان يلمس اي ملف.' },
         { icon: 'EDIT', title: 'يكتب، يعدل، وينشئ الملفات', desc: 'يستطيع SUNy انشاء ملفات جديدة، تعديل الموجودة، وتنظيم مشروعك -- كل ذلك دون ان تحرك اصبعا.' },
         { icon: 'AUTO', title: 'يتعامل مع الامور الصعبة تلقائيا', desc: 'ينجز SUNy كل شيء خلف الكواليس، ويبقيك على اطلاع بتحديثات ودية وبلغة بسيطة.' },
         { icon: 'LOOP', title: 'لا يستسلم', desc: 'اذا لم ينجح الامر من المحاولة الاولى، يجرب SUNy نهجا مختلفا. يستمر حتى يصل الى الحل.' },
+        { icon: 'DIAG', title: '🔀 اختبار الفرضيات المتوازي', desc: 'للمشاكل الصعبة، يطلق SUNy عدة وكلاء مصغرين باستراتيجيات مختلفة في وقت واحد ويختار افضل نتيجة.' },
+        { icon: 'DAG', title: '📊 رسم بياني لتبعية المهام', desc: 'يتم تحليل المهام المعقدة الى خطوات مرتبة حسب التبعية. يعمل SUNy على الرسم البياني ويرفع النتائج الى الهدف.' },
+        { icon: 'CONF', title: '📈 قياس الثقة', desc: 'SUNy يقيس مستوى ثقته في كل خطوة. الثقة المنخفضة تؤدي تلقائيا الى الترقية الى نموذج اقوى.' },
         { icon: 'PROJ', title: 'مشاريع متعددة', desc: 'اعمل على اي عدد من المشاريع تريد. SUNy يبقي كل شيء منظما ومنفصلا.' },
         { icon: 'MEM', title: 'يصبح اذكى كلما استخدمته اكثر', desc: 'يتذكر SUNy تفضيلاتك واسلوب عملك وقراراتك السابقة -- حتى تشعر في كل جلسة بالالفة.' },
         { icon: 'LANG', title: 'لغة بسيطة دائما', desc: 'لا مصطلحات تقنية. SUNy يشرح ما يفعله بطريقة مفهومة ومريحة.' },

@@ -1738,6 +1738,14 @@ server.listen(PORT, () => {
   try { initializeInteractionPatternsTable(); } catch {}
   // Initialize presence table (best-effort)
   try { initializePresenceTable(); } catch {}
+  // Initialize goal tracker table (best-effort)
+  try { require('./goal-tracker').initializeGoalTrackerTable(); } catch {}
+  // Initialize confidence scoring table (best-effort)
+  try { require('./confidence-scorer').initializeConfidenceTable(); } catch {}
+  // Initialize task graph table (best-effort)
+  try { require('./task-graph').initializeTaskGraphTable(); } catch {}
+  // Initialize hypothesis engine table (best-effort)
+  try { require('./hypothesis-engine').initializeHypothesisTable(); } catch {}
   // Initialize skill system (loads skills/ directory SKILL.md files)
   initSkillSystem().catch(e => console.warn('[skill-system] init failed:', (e as Error).message));
 });
