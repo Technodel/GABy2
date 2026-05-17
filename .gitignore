@@ -17,6 +17,14 @@ bridge/node_modules/
 # AiderDesk (auto-generated)
 .aider-desk/
 
+# Temp and scratch files
+temp_*
+_temp_*
+*.pyc
+__pycache__/
+*.tgz
+*.bat
+
 # Backup directories
 SUNy-14B-Agent-Demo_bak/
 
