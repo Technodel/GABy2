@@ -2716,6 +2716,11 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
                     onChange={e => {
                       const file = e.target.files?.[0];
                       if (!file) return;
+                      if (selectedMode === 'free') {
+                        addMessage('system', '📷 Image analysis requires 🚀 Fast or 🧠 Pro mode. Switch to a higher tier to analyze images.');
+                        e.target.value = '';
+                        return;
+                      }
                       if (file.size > 10 * 1024 * 1024) {
                         addMessage('system', '⚠️ Image is too large (max 10 MB). Please resize and try again.');
                         e.target.value = '';
@@ -2744,6 +2749,11 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
                       if (!items) return;
                       for (const item of Array.from(items)) {
                         if (item.type.startsWith('image/')) {
+                          if (selectedMode === 'free') {
+                            e.preventDefault();
+                            addMessage('system', '📷 Image analysis requires 🚀 Fast or 🧠 Pro mode. Switch to a higher tier to analyze images.');
+                            break;
+                          }
                           e.preventDefault();
                           const file = item.getAsFile();
                           if (!file) continue;
@@ -2791,8 +2801,8 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
                   <button
                     className="btn btn-icon btn-secondary"
                     onClick={() => fileInputRef.current?.click()}
-                    disabled={thinking}
-                    title="Attach an image for analysis"
+                    disabled={thinking || selectedMode === 'free'}
+                    title={selectedMode === 'free' ? 'Image analysis requires Fast or Pro mode' : 'Attach an image for analysis'}
                     style={{
                       alignSelf: 'flex-end',
                       padding: '10px 12px',
@@ -2804,22 +2814,24 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
                   >
                     <Image size={15} />
                   </button>
-                  {/* Talk / Write mode toggle */}
-                  <button
-                    className="btn btn-icon btn-secondary"
-                    onClick={toggleTalkMode}
-                    title={talkMode ? 'Talk Mode — no file changes (click to switch to Write Mode)' : 'Write Mode — full file editing (click to switch to Talk Mode)'}
-                    style={{
-                      alignSelf: 'flex-end',
-                      padding: '10px 12px',
-                      background: talkMode ? 'rgba(108,99,255,0.12)' : 'transparent',
-                      border: talkMode ? '1px solid var(--accent)' : '1px solid var(--border)',
-                      color: talkMode ? 'var(--accent)' : 'var(--text-muted)',
-                      transition: 'all 0.15s',
-                    }}
-                  >
-                    {talkMode ? <MessageSquare size={15} /> : <Pencil size={15} />}
-                  </button>
+                  {/* Talk / Write mode toggle — hidden when free plan enforced by no balance */}
+                  {!noBalance && (
+                    <button
+                      className="btn btn-icon btn-secondary"
+                      onClick={toggleTalkMode}
+                      title={talkMode ? 'Talk Mode — no file changes (click to switch to Write Mode)' : 'Write Mode — full file editing (click to switch to Talk Mode)'}
+                      style={{
+                        alignSelf: 'flex-end',
+                        padding: '10px 12px',
+                        background: talkMode ? 'rgba(108,99,255,0.12)' : 'transparent',
+                        border: talkMode ? '1px solid var(--accent)' : '1px solid var(--border)',
+                        color: talkMode ? 'var(--accent)' : 'var(--text-muted)',
+                        transition: 'all 0.15s',
+                      }}
+                    >
+                      {talkMode ? <MessageSquare size={15} /> : <Pencil size={15} />}
+                    </button>
+                  )}
                   {thinking ? (
                     <button
                       className="btn btn-danger"

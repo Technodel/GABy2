@@ -156,9 +156,9 @@ function runMigrations(db: Database.Database): void {
     db.prepare(`INSERT INTO pricing_modes (mode, display_name, description, markup_formula, input_token_base_cost, output_token_base_cost, model_id) VALUES (?, ?, ?, ?, ?, ?, ?)`)
       .run('free', '⚡ AFree', 'Almost free — Groq-powered with OpenRouter fallback', 'cost * 2.0', 0.00000059, 0.00000079, 'llama-3.3-70b-versatile');
     db.prepare(`INSERT INTO pricing_modes (mode, display_name, description, markup_formula, input_token_base_cost, output_token_base_cost, model_id) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run('fast', '🚀 Fast Smart', 'Smart & affordable — DeepSeek V3, excellent for coding and everyday tasks', 'cost * 2.5', 0.00000027, 0.0000011, 'deepseek-chat');
+      .run('fast', '🚀 Fast Smart', 'Smart & affordable — OpenRouter Llama Vision, excellent for coding and image analysis', 'cost * 2.5', 0.00000027, 0.0000011, 'meta-llama/llama-3.2-11b-vision-instruct:free');
     db.prepare(`INSERT INTO pricing_modes (mode, display_name, description, markup_formula, input_token_base_cost, output_token_base_cost, model_id) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run('pro', '🧠 Smart Pro', 'Maximum intelligence — DeepSeek R1 reasoning model for complex problems', 'cost * 3.0', 0.00000055, 0.00000219, 'deepseek-reasoner');
+      .run('pro', '🧠 Smart Pro', 'Maximum intelligence — HuggingFace Llama Vision for complex analysis and image understanding', 'cost * 3.0', 0.00000055, 0.00000219, 'meta-llama/Llama-3.2-11B-Vision-Instruct');
   }
 
   // ── Update existing mode configs to current defaults ──────────────────────
@@ -168,9 +168,9 @@ function runMigrations(db: Database.Database): void {
     db.prepare(`UPDATE pricing_modes SET display_name=?, description=?, model_id=?, input_token_base_cost=?, output_token_base_cost=? WHERE mode='free'`)
       .run('⚡ AFree', 'Almost free — Groq-powered with OpenRouter fallback', 'llama-3.3-70b-versatile', 0.00000059, 0.00000079);
     db.prepare(`UPDATE pricing_modes SET display_name=?, description=?, model_id=?, input_token_base_cost=?, output_token_base_cost=? WHERE mode='fast'`)
-      .run('🚀 Fast Smart', 'Smart & affordable — DeepSeek V3, excellent for coding and everyday tasks', 'deepseek-chat', 0.00000027, 0.0000011);
+      .run('🚀 Fast Smart', 'Smart & affordable — OpenRouter Llama Vision, excellent for coding and image analysis', 'meta-llama/llama-3.2-11b-vision-instruct:free', 0.00000027, 0.0000011);
     db.prepare(`UPDATE pricing_modes SET display_name=?, description=?, model_id=?, input_token_base_cost=?, output_token_base_cost=? WHERE mode='pro'`)
-      .run('🧠 Smart Pro', 'Maximum intelligence — DeepSeek R1 reasoning model for complex problems', 'deepseek-reasoner', 0.00000055, 0.00000219);
+      .run('🧠 Smart Pro', 'Maximum intelligence — HuggingFace Llama Vision for complex analysis and image understanding', 'meta-llama/Llama-3.2-11B-Vision-Instruct', 0.00000055, 0.00000219);
     db.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('modes_v2_seeded', 'true')").run();
   }
 
@@ -187,27 +187,27 @@ function runMigrations(db: Database.Database): void {
   }
 
   // ── Seed default API keys from environment variables ─────────────────────
-  // NEVER hardcode API keys in source code. Set them via .env or docker environment.
+  // Set SUNY_GROQ_KEY, SUNY_OPENROUTER_KEY, SUNY_OPENAI_KEY, SUNY_DEEPSEEK_KEY,
+  // SUNY_ANTHROPIC_KEY, SUNY_HUGGINGFACE_KEY, or SUNY_GEMINI_KEY in .env
   const keysSeeded = db.prepare("SELECT value FROM app_settings WHERE key='default_keys_seeded'").get();
   if (!keysSeeded) {
     db.prepare('DELETE FROM api_keys').run();
-    // Only seed if env vars are set (first-time setup)
     const groqKey = process.env.SUNY_GROQ_KEY;
     const openrouterKey = process.env.SUNY_OPENROUTER_KEY;
-    const deepseekKey = process.env.SUNY_DEEPSEEK_KEY;
     if (groqKey) {
       db.prepare(`INSERT INTO api_keys (provider, key_value, mode, is_active, label, priority, model_id_override) VALUES (?, ?, ?, 1, ?, ?, ?)`)
-        .run('Groq', groqKey, 'free', '⚡ Free Mode – Groq (primary)', 1, 'llama-3.3-70b-versatile');
+        .run('Groq', groqKey, 'free', '⚡ Free Mode – Groq', 1, 'llama-3.3-70b-versatile');
     }
     if (openrouterKey) {
       db.prepare(`INSERT INTO api_keys (provider, key_value, mode, is_active, label, priority, model_id_override) VALUES (?, ?, ?, 1, ?, ?, ?)`)
-        .run('OpenRouter', openrouterKey, 'free', '⚡ Free Mode – OpenRouter (fallback)', 2, 'meta-llama/llama-3.3-70b-instruct:free');
+        .run('OpenRouter', openrouterKey, 'fast', '🚀 Fast Mode – OpenRouter Llama Vision', 1, 'meta-llama/llama-3.2-11b-vision-instruct:free');
+      db.prepare(`INSERT INTO api_keys (provider, key_value, mode, is_active, label, priority, model_id_override) VALUES (?, ?, ?, 1, ?, ?, ?)`)
+        .run('OpenRouter', openrouterKey, 'pro', '🧠 Pro Mode – OpenRouter (fallback)', 2, 'meta-llama/llama-3.2-11b-vision-instruct:free');
     }
-    if (deepseekKey) {
+    const huggingfaceKey = process.env.SUNY_HUGGINGFACE_KEY;
+    if (huggingfaceKey) {
       db.prepare(`INSERT INTO api_keys (provider, key_value, mode, is_active, label, priority, model_id_override) VALUES (?, ?, ?, 1, ?, ?, ?)`)
-        .run('DeepSeek', deepseekKey, 'fast', '🚀 Fast Mode – DeepSeek V3', 1, 'deepseek-chat');
-      db.prepare(`INSERT INTO api_keys (provider, key_value, mode, is_active, label, priority, model_id_override) VALUES (?, ?, ?, 1, ?, ?, ?)`)
-        .run('DeepSeek', deepseekKey, 'pro', '🧠 Pro Mode – DeepSeek R1', 1, 'deepseek-reasoner');
+        .run('HuggingFace', huggingfaceKey, 'pro', '🧠 Pro Mode – HuggingFace Llama Vision', 1, 'meta-llama/Llama-3.2-11B-Vision-Instruct');
     }
     db.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('default_keys_seeded', 'true')").run();
   }

@@ -14,11 +14,14 @@ src/renderer/dist/
 bridge/dist/
 bridge/node_modules/
 
-# AiderDesk task state files (auto-generated)
-.aider-desk/tasks/
+# AiderDesk (auto-generated)
+.aider-desk/
 
 # Backup directories
 SUNy-14B-Agent-Demo_bak/
+
+# Scripts directory (DB setup helpers)
+scripts/
 
 # Prevent secret leaks
 .aider.input.history
