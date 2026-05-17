@@ -12,14 +12,23 @@
  */
 
 import { streamText, generateText, type CoreMessage, type LanguageModel } from 'ai';
-import { getModelsForMode, isCachingEnabled, getEditFormat } from './agent';
+import { getModelsForMode, getVisionCapableModels, isCachingEnabled, getEditFormat } from './agent';
 import { createPowerTools } from './power-tools';
+import { createWebSearchTool } from './web-search';
+import { createUrlFetchTool } from './url-fetch';
+import { createMemoryTools } from './user-memory';
+import { createSymbolReaderTool } from './symbol-reader';
+import { createSubtaskDelegatorTool } from './subtask-delegator';
+import { createPromptRegistryTool } from './prompt-registry';
+import { createFileDiscoveryTool } from './file-discovery';
+import { createSelfHealTool } from './error-corrector';
 import { mcpManager } from './mcp-manager';
 import { userClientManager } from './user-client-manager';
 import { isBridgeConnected } from './bridge-manager';
 import { invalidateRepoMap } from './repo-map';
 import { gitAutoCommit, createCheckpoint } from './git-manager';
 import { trimHistory } from './context-manager';
+import { classifyTask, getActiveSkills } from './skill-loader';
 import { runLint } from './lint-runner';
 import { runTests, runFailingTests, buildTestFixPrompt } from './test-runner';
 import { pickRandom } from './personality';
@@ -101,6 +110,7 @@ export interface AgentLoopRequest {
   projectPath?: string;
   history: AgentMessage[];
   userMessage: string;
+  imageData?: string;        // base64-encoded image for vision/multimodal analysis
   sessionId: string;
   talkMode?: boolean;
   signal?: AbortSignal;
@@ -159,13 +169,26 @@ function classifyAutoMode(message: string): 'free' | 'fast' | 'smart' | 'pro' {
 }
 
 export async function runAgentLoop(req: AgentLoopRequest): Promise<AgentLoopResult> {
-  const { userId, mode, systemPrompt, projectPath, history, userMessage, sessionId, talkMode, signal, onChunk } = req;
+  const { userId, mode, systemPrompt, projectPath, history, userMessage, imageData, sessionId, talkMode, signal, onChunk } = req;
   const startedAt = Date.now();
 
   // Resolve AUTO → real mode via keyword classification
   const resolvedMode = mode === 'auto' ? classifyAutoMode(userMessage) : mode;
 
-  const modelEntries = getModelsForMode(resolvedMode);
+  // When imageData is present, prefer vision-capable models across all modes
+  const isVisionRequest = !!imageData;
+  const modelEntries = isVisionRequest
+    ? (() => {
+        const vision = getVisionCapableModels();
+        if (vision.length > 0) {
+          console.log(`[agent-loop] Using vision-capable models: ${vision.map(v => v.provider).join(', ')}`);
+          return vision;
+        }
+        console.warn('[agent-loop] imageData present but no vision-capable model found');
+        // Return empty list to trigger the no-vision-model error below
+        return [];
+      })()
+    : getModelsForMode(resolvedMode);
   let lastError: Error = new Error('No models available');
 
   // Track files changed during this turn (for git auto-commit + cache invalidation)
@@ -181,9 +204,13 @@ export async function runAgentLoop(req: AgentLoopRequest): Promise<AgentLoopResu
   let testGaveUp = false;
 
   // Build CoreMessage history, trimmed to fit context window
+  // If imageData is provided, use multimodal content format (text + image parts)
+  const userContent: CoreMessage['content'] = imageData
+    ? [{ type: 'text', text: userMessage }, { type: 'image', image: imageData }]
+    : userMessage;
   const rawMessages: CoreMessage[] = [
     ...history.map(h => ({ role: h.role as 'user' | 'assistant', content: h.content })),
-    { role: 'user' as const, content: userMessage },
+    { role: 'user' as const, content: userContent },
   ];
 
   // Determine edit format (needs bridgeConnected, must come before fullSystem)
@@ -207,42 +234,109 @@ export async function runAgentLoop(req: AgentLoopRequest): Promise<AgentLoopResu
     ? `${systemPrompt}\n\n${ARCHITECT_PLAN_INSTRUCTIONS}\n\n<WorkingDirectory>${projectPath ?? '(no project)'}</WorkingDirectory>`
     : null;
 
-  const fullSystem = architectPlanSystem ?? (projectPath
+  let fullSystem = architectPlanSystem ?? (projectPath
     ? `${systemPrompt}${formatSystemAddition}\n\n<WorkingDirectory>${projectPath}</WorkingDirectory>\nAll relative file paths are resolved against this directory.`
     : systemPrompt + formatSystemAddition);
 
+  // ── Runtime skill classification: inject relevant skill instructions ─────
+  // Identify which engineering skill applies to this specific task and inject
+  // its process guidance into the system prompt.
+  if (userMessage) {
+    const classification = classifyTask(userMessage);
+    const activeSkills = getActiveSkills(userMessage);
+    if (classification.confidence >= 0.3 && activeSkills.length > 0) {
+      const skillBlock = [
+        '',
+        '<active_skills>',
+        `Detected phase: ${classification.phase} | Skill: ${classification.skillName ?? 'none'} (confidence: ${(classification.confidence * 100).toFixed(0)}%)`,
+        'The following skills are active for this task. Follow their processes:',
+        ...activeSkills.map(s => `  • ${s.name}: ${s.description}`),
+        '</active_skills>',
+      ].join('\n');
+      // Inject into fullSystem — append before the WorkingDirectory block or at the end
+      const insertionPoint = fullSystem.lastIndexOf('\n<WorkingDirectory>');
+      if (insertionPoint >= 0) {
+        // Insert skill block right before the working directory tag
+        fullSystem = fullSystem.slice(0, insertionPoint) + '\n' + skillBlock + fullSystem.slice(insertionPoint);
+      } else {
+        fullSystem = fullSystem + '\n' + skillBlock;
+      }
+      console.log(`[agent-loop] Skill classification: ${classification.phase} → ${classification.skillName} (${(classification.confidence * 100).toFixed(0)}%)`);
+    }
+  }
+
   // Build tools (only if bridge is connected, project is set, and NOT in talk mode)
   // MCP tools from connected servers are merged automatically
+  // ── Model references (set inside model loop, used by lazy-getter tools) ──
+  let currentModel: LanguageModel | undefined;
+  let currentProvider: string = '';
+
+  // ── Web tools (always available — server-side, no bridge needed) ────────
+  const webSearch = createWebSearchTool();
+  const urlFetch = createUrlFetchTool();
+  const alwaysTools: Record<string, any> = { web_search: webSearch, url_fetch: urlFetch };
+
   const mcpToolsAvailable = mcpManager.availableToolCount > 0;
-  const tools = (bridgeConnected && projectPath && !talkMode)
-    ? (() => {
-        const powerTools = createPowerTools({
+  const tools = (() => {
+    if (bridgeConnected && projectPath && !talkMode) {
+      const powerTools = createPowerTools({
+        userId,
+        projectPath,
+        signal,
+        onToolCall: (name, input) => {
+          toolCallNames.add(name);
+          console.log(`[agent-loop] tool call: ${name}`, input);
+          userClientManager.pushToUser(userId, 'suny:tool_call', { tool: name, input });
+        },
+        onFileChanged: (absPath) => {
+          changedFiles.add(absPath);
+          if (projectPath) invalidateRepoMap(userId, projectPath);
+        },
+      });
+      // ── Additional SUNy tools (memory, symbol, prompt, discovery, delegation, healing) ──
+      const memoryTools = createMemoryTools({ userId, projectPath });
+      const symbolReaderTool = createSymbolReaderTool({ userId, projectPath });
+      const promptRegistryTool = createPromptRegistryTool({ userId });
+      const fileDiscoveryTool = createFileDiscoveryTool({ userId, projectPath });
+      const subtaskDelegatorTool = createSubtaskDelegatorTool({
+        getContext: () => ({
           userId,
           projectPath,
+          model: currentModel as LanguageModel,
+          provider: currentProvider,
           signal,
-          onToolCall: (name, input) => {
-            toolCallNames.add(name);
-            console.log(`[agent-loop] tool call: ${name}`, input);
-            userClientManager.pushToUser(userId, 'suny:tool_call', { tool: name, input });
-          },
-          onFileChanged: (absPath) => {
-            changedFiles.add(absPath);
-            // Invalidate repo map cache immediately so the next message sees fresh symbols
-            if (projectPath) invalidateRepoMap(userId, projectPath);
-          },
-        });
-        // Merge MCP tools if any servers are connected
-        if (mcpToolsAvailable) {
-          const mcpTools = mcpManager.getTools();
-          const merged = { ...powerTools, ...mcpTools };
-          if (Object.keys(mcpTools).length > 0) {
-            console.log(`[agent-loop] Merged ${Object.keys(mcpTools).length} MCP tool(s) into toolset`);
-          }
-          return merged;
+        }),
+        getSystemPrompt: () => fullSystem,
+        getHistory: () => history,
+      });
+      const selfHealTool = createSelfHealTool(() => ({
+        model: currentModel as LanguageModel,
+        signal,
+      }));
+
+      const extraTools = {
+        ...memoryTools,     // save_memory, recall_memories, delete_memory
+        read_symbols: symbolReaderTool,
+        get_prompt_template: promptRegistryTool,
+        find_files: fileDiscoveryTool,
+        delegate_subtask: subtaskDelegatorTool,
+        self_heal: selfHealTool,
+      };
+
+      let merged = { ...alwaysTools, ...powerTools, ...extraTools };
+      if (mcpToolsAvailable) {
+        const mcpTools = mcpManager.getTools();
+        merged = { ...merged, ...mcpTools };
+        if (Object.keys(mcpTools).length > 0) {
+          console.log(`[agent-loop] Merged ${Object.keys(mcpTools).length} MCP tool(s) into toolset`);
         }
-        return powerTools;
-      })()
-    : undefined;
+      }
+      return merged;
+    }
+    // Bridge offline, no project, or talk mode — still provide web tools
+    console.log('[agent-loop] Bridge/project tools unavailable; web_search + url_fetch only');
+    return alwaysTools;
+  })();
 
   const effectiveTools = textFormat ? undefined : tools;
 
@@ -260,8 +354,17 @@ export async function runAgentLoop(req: AgentLoopRequest): Promise<AgentLoopResu
   let totalCacheRead = 0;
   let steps = 0;
 
+  // If image data is present but no vision-capable models were found, throw
+  if (isVisionRequest && modelEntries.length === 0) {
+    throw new Error('NO_VISION_MODEL_AVAILABLE');
+  }
+
   // Try each model in priority order (fallback on error)
   for (const { model, provider } of modelEntries) {
+    // Update model references for lazy-getter tools (subtask delegator, self-heal)
+    currentModel = model as LanguageModel;
+    currentProvider = provider;
+
     try {
       // Trim history to fit this provider's context window
       const messages = trimHistory(rawMessages, fullSystem, provider);

@@ -74,6 +74,56 @@ const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai';
 
 /**
+ * Known vision-capable model IDs per provider, in preference order (cheapest/fastest first).
+ * Used when imageData is present in a request — we search ALL active keys across all modes.
+ */
+const VISION_MODEL_MAP: Record<string, string[]> = {
+  Groq: ['llama-3.2-11b-vision-preview', 'llama-3.2-90b-vision-preview'],
+  'OpenRouter': [
+    'meta-llama/llama-3.2-11b-vision-instruct:free',
+    'google/gemini-2.0-flash-lite-preview-02-05:free',
+    'google/gemini-2.0-flash-exp:free',
+  ],
+  OpenAI: ['gpt-4o-mini', 'gpt-4o'],
+  Anthropic: ['claude-3-haiku-20240307', 'claude-3-5-sonnet-20241022'],
+  Gemini: ['gemini-2.0-flash-lite', 'gemini-2.0-flash'],
+  HuggingFace: ['meta-llama/Llama-3.2-11B-Vision-Instruct'],
+};
+
+/**
+ * Search ALL active API keys across all modes for vision-capable models.
+ * Returns entries sorted by priority (primary keys first) so the agent loop
+ * can use fallback iteration.
+ */
+export function getVisionCapableModels(): Array<{ model: LanguageModel; provider: string }> {
+  const allKeys = getDb()
+    .prepare('SELECT key_value, provider, model_id_override, priority FROM api_keys WHERE is_active = 1 ORDER BY priority ASC')
+    .all() as Array<{ key_value: string; provider: string; model_id_override: string | null; priority: number }>;
+
+  const results: Array<{ model: LanguageModel; provider: string }> = [];
+  const seen = new Set<string>();
+
+  for (const key of allKeys) {
+    const visionModels = VISION_MODEL_MAP[key.provider];
+    if (!visionModels) continue;
+    const dedupKey = `${key.provider}:${key.key_value.slice(0, 12)}`;
+    if (seen.has(dedupKey)) continue;
+    seen.add(dedupKey);
+    for (const modelId of visionModels) {
+      try {
+        const model = buildLanguageModel(key, modelId);
+        results.push({ model, provider: key.provider });
+        break; // one vision model per key is enough
+      } catch {
+        continue; // try next model id for this key
+      }
+    }
+  }
+
+  return results;
+}
+
+/**
  * Build a Vercel AI SDK LanguageModel from a DB key entry + model id.
  */
 export function buildLanguageModel(key: KeyEntry, modelId: string): LanguageModel {

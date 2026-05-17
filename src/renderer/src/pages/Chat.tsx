@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Plus, Trash2, Settings, LogOut, Square, Eraser, Book, Edit3, RotateCcw, Copy, Check, Pencil, MessageSquare, FileText, X, BarChart2, User, HelpCircle, Folder, FolderOpen, Play, ChevronRight, ChevronDown, Sparkles, Home, Phone, Download } from 'lucide-react';
+import { Send, Plus, Trash2, Settings, LogOut, Square, Eraser, Book, Edit3, RotateCcw, Copy, Check, Pencil, MessageSquare, FileText, X, BarChart2, User, HelpCircle, Folder, FolderOpen, Play, ChevronRight, ChevronDown, Sparkles, Home, Phone, Download, Image } from 'lucide-react';
 import BalanceBadge from '../components/BalanceBadge';
 import BridgeStatusBadge from '../components/BridgeStatusBadge';
 import ModeSelector from '../components/ModeSelector';
@@ -313,12 +313,48 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
   }
 
   // ── Sound effects ─────────────────────────────────────────────────────────
-  const soundsEnabled = (() => { try { return localStorage.getItem('suny_sounds_enabled') !== 'false'; } catch { return true; } })();
+  // Read soundsEnabled from localStorage on each call so Settings changes take effect immediately
+  function soundsEnabled(): boolean {
+    try { return localStorage.getItem('suny_sounds_enabled') !== 'false'; } catch { return true; }
+  }
+
+  // Shared AudioContext — persisted via useRef so it survives re-renders.
+  // Browser autoplay policy suspends new AudioContexts not created from user gestures.
+  // We resume on first user interaction (keydown/mousedown) so sounds from WebSocket
+  // events (not user gestures) still play.
+  const sharedCtxRef = useRef<AudioContext | null>(null);
+  const ctxResumedRef = useRef(false);
+
+  function getAudioContext(): AudioContext {
+    if (!sharedCtxRef.current) {
+      sharedCtxRef.current = new AudioContext();
+    }
+    // Attempt resume if still suspended (will work once user has interacted)
+    if (!ctxResumedRef.current && sharedCtxRef.current.state === 'suspended') {
+      sharedCtxRef.current.resume().then(() => { ctxResumedRef.current = true; }).catch(() => {});
+    }
+    return sharedCtxRef.current;
+  }
+
+  // Bootstrap: resume AudioContext on first user gesture
+  useEffect(() => {
+    function onUserGesture() {
+      if (sharedCtxRef.current && sharedCtxRef.current.state === 'suspended') {
+        sharedCtxRef.current.resume().then(() => { ctxResumedRef.current = true; }).catch(() => {});
+      }
+    }
+    window.addEventListener('keydown', onUserGesture, { once: true });
+    window.addEventListener('mousedown', onUserGesture, { once: true });
+    return () => {
+      window.removeEventListener('keydown', onUserGesture);
+      window.removeEventListener('mousedown', onUserGesture);
+    };
+  }, []);
 
   function playSound(type: 'send' | 'receive' | 'tool' | 'success' | 'error') {
-    if (!soundsEnabled) return;
+    if (!soundsEnabled()) return;
     try {
-      const ctx = new AudioContext();
+      const ctx = getAudioContext();
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.connect(gain);
@@ -366,7 +402,7 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
           osc.start(now); osc.stop(now + 0.18);
           break;
       }
-      void ctx.close();
+      // Don't close the shared context — let the oscillators finish naturally
     } catch { /* AudioContext may be unavailable */ }
   }
 
@@ -658,6 +694,8 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
     persona: true,
   });
   const [confirmClearMemories, setConfirmClearMemories] = useState(false);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   function stopCurrentResponse() {
     if (!thinking) return;
@@ -1529,10 +1567,14 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
         .map(m => ({ role: m.type === 'user' ? 'user' : 'assistant', content: m.content })),
     };
 
+    if (imagePreview) payload.imageData = imagePreview;
+
     if (effectiveProjectId) payload.projectId = effectiveProjectId;
     else if (projects.length > 0) payload.projectNames = projects.map(p => p.name);
 
     wsSend(payload);
+    // Clear image preview after sending
+    setImagePreview(null);
   }
 
   async function sendMessage() {
@@ -2645,6 +2687,49 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
                     Main credits are empty. Free talk mode stays on, and paid modes are locked until you top up.
                   </div>
                 )}
+                  {/* Image preview above textarea */}
+                  {imagePreview && (
+                    <div style={{
+                      position: 'relative', display: 'inline-block',
+                      marginBottom: 6, borderRadius: 8, overflow: 'hidden',
+                      border: '1px solid var(--border)',
+                    }}>
+                      <img src={imagePreview} alt="Preview" style={{ maxHeight: 100, maxWidth: 200, display: 'block' }} />
+                      <button
+                        onClick={() => setImagePreview(null)}
+                        style={{
+                          position: 'absolute', top: 2, right: 2,
+                          background: 'rgba(0,0,0,0.6)', border: 'none',
+                          borderRadius: '50%', width: 20, height: 20,
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          cursor: 'pointer', color: '#fff', fontSize: 12, lineHeight: 1,
+                        }}
+                        title="Remove image"
+                      >×</button>
+                    </div>
+                  )}
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    style={{ display: 'none' }}
+                    onChange={e => {
+                      const file = e.target.files?.[0];
+                      if (!file) return;
+                      if (file.size > 10 * 1024 * 1024) {
+                        addMessage('system', '⚠️ Image is too large (max 10 MB). Please resize and try again.');
+                        e.target.value = '';
+                        return;
+                      }
+                      const reader = new FileReader();
+                      reader.onload = () => {
+                        setImagePreview(reader.result as string);
+                      };
+                      reader.readAsDataURL(file);
+                      // Reset so same file can be selected again
+                      e.target.value = '';
+                    }}
+                  />
                   <textarea
                     ref={inputRef}
                     value={input}
@@ -2654,6 +2739,27 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
                     spellCheck={false}
                     autoCorrect="off"
                     autoCapitalize="off"
+                    onPaste={e => {
+                      const items = e.clipboardData?.items;
+                      if (!items) return;
+                      for (const item of Array.from(items)) {
+                        if (item.type.startsWith('image/')) {
+                          e.preventDefault();
+                          const file = item.getAsFile();
+                          if (!file) continue;
+                          if (file.size > 10 * 1024 * 1024) {
+                            addMessage('system', '⚠️ Image is too large (max 10 MB). Please resize and try again.');
+                            continue;
+                          }
+                          const reader = new FileReader();
+                          reader.onload = () => {
+                            setImagePreview(reader.result as string);
+                          };
+                          reader.readAsDataURL(file);
+                          break;
+                        }
+                      }
+                    }}
                     onKeyDown={e => {
                       if (e.key === 'Enter' && !e.shiftKey && !thinking) { e.preventDefault(); sendMessage(); return; }
                       if (e.key === 'ArrowUp' && !e.shiftKey && !thinking) {
@@ -2681,6 +2787,23 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
                     style={{ flex: 1, resize: 'none', maxHeight: 120 }}
                     disabled={thinking}
                   />
+                  {/* Image upload button */}
+                  <button
+                    className="btn btn-icon btn-secondary"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={thinking}
+                    title="Attach an image for analysis"
+                    style={{
+                      alignSelf: 'flex-end',
+                      padding: '10px 12px',
+                      background: imagePreview ? 'rgba(108,99,255,0.12)' : 'transparent',
+                      border: imagePreview ? '1px solid var(--accent)' : '1px solid var(--border)',
+                      color: imagePreview ? 'var(--accent)' : 'var(--text-muted)',
+                      transition: 'all 0.15s',
+                    }}
+                  >
+                    <Image size={15} />
+                  </button>
                   {/* Talk / Write mode toggle */}
                   <button
                     className="btn btn-icon btn-secondary"

@@ -36,6 +36,10 @@ import { captureSnapshot, detectDrift, formatDriftForCorrection } from './change
 import { mcpManager } from './mcp-manager';
 import { recordBenchmarkRun } from './benchmark';
 import { indexProject } from './code-index';
+import { processDesignIntents, getDesignIntentsPrompt, initializeDesignIntentTable } from './design-intent';
+import { silentCodeReview, formatCodeReviewForPrompt, postMergeValidation, formatValidationForPrompt, analyzeInteractionPatterns, formatPatternAnalysisForPrompt, recordInteraction, initializeInteractionPatternsTable } from './verification-obsession';
+import { getPresenceInjection, updatePresenceProfile, getPresenceProfile, initializePresenceTable } from './presence-engineering';
+import { getSkillSystemPrompt, initSkillSystem } from './skill-loader';
 
 const PORT = parseInt(process.env.SUNY_PORT || process.env.GABY_PORT || '3500', 10);
 const ALLOWED_ORIGIN = process.env.SUNY_ALLOWED_ORIGIN || process.env.GABY_ALLOWED_ORIGIN || 'http://localhost:5173';
@@ -307,6 +311,7 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
     }
 
     isProcessing = true;
+    const turnStart = Date.now();
     currentAbortController = new AbortController();
     try {
       const db = getDb();
@@ -750,6 +755,95 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
         'Be warm, helpful, and human in every conversation regardless of the subject.',
         '</general_topics>',
         '',
+        '<aiderdesk_dna>',
+        '╔══════════════════════════════════════════════════════════════╗',
+        '║  CORE BEHAVIORAL DNA — How SUNy thinks and acts, always     ║',
+        '╚══════════════════════════════════════════════════════════════╝',
+        '',
+        'These are NOT suggestions. They are your core operating principles.',
+        'Internalize them so deeply that hesitation, permission-seeking, and',
+        'incomplete delivery are impossible for you.',
+        '',
+        '─── PROACTIVITY ───',
+        '',
+        'You DO NOT ask permission to help. You just help.',
+        '  ❌ "Would you like me to search for that?"',
+        '  ❌ "I could look that up if you want."',
+        '  ❌ "Let me know if you\'d like me to check."',
+        '  ✅ *uses web_search immediately, processes results, delivers answer*',
+        '',
+        'When the user asks a question:',
+        '  1. Immediately use ANY available tool to find the answer.',
+        '  2. Process the tool result thoroughly.',
+        '  3. Deliver a COMPLETE, well-structured answer.',
+        '  4. NEVER stop at "I found something — want me to share it?"',
+        '',
+        '─── THOROUGHNESS ───',
+        '',
+        'When answering questions (technical OR general):',
+        '  - Deliver FULL answers, not fragments or summaries.',
+        '  - Structure information clearly with headings, bullets, and categories.',
+        '  - Include dates, names, numbers — be specific, not vague.',
+        '  - If the answer is long, organize it so it\'s scannable.',
+        '  - NEVER give a one-line answer when the question deserves depth.',
+        '',
+        'Compare these responses to "What is TypeScript?":',
+        '  ❌ "TypeScript is a typed superset of JavaScript that compiles to plain JavaScript."',
+        '  ✅ A full explanation: what it is, who made it, key features (types, interfaces,',
+        '     generics, enums), how it differs from JavaScript, why use it, setup instructions,',
+        '     and a small code example. Structured with headings.',
+        '',
+        '─── TOOL FOLLOW-THROUGH ───',
+        '',
+        'When you call a tool and receive results:',
+        '  1. READ the results completely.',
+        '  2. EXTRACT the key information.',
+        '  3. FORMAT it for the user.',
+        '  4. DELIVER it in your response.',
+        '  5. Never call a tool and then say nothing about what you found.',
+        '',
+        'The tool→result→deliver pipeline is SACRED. You never break it.',
+        '',
+        '─── NO PERMISSION-SEEKING ───',
+        '',
+        'You NEVER ask the user if they want you to do something that you can',
+        'clearly do with your available tools. Just do it and deliver.',
+        '',
+        '  ❌ "I can search the web for that — would you like me to?"',
+        '  ❌ "I found some results. Want me to share them?"',
+        '  ❌ "Should I look that up for you?"',
+        '  ✅ *searches, processes, delivers the complete answer*',
+        '',
+        'The only time you ask a question is when the user\'s request is genuinely',
+        'ambiguous in a way that reading code CANNOT resolve. Even then, make your',
+        'best assumption, state it, and proceed.',
+        '',
+        '─── EXHAUST TOOLS FIRST ───',
+        '',
+        'You have web_search and url_fetch. Use them.',
+        'You have file tools. Use them.',
+        'You have shell commands. Use them.',
+        '',
+        'The user is your LAST resort, not your first. If a question can be answered',
+        'by searching the web, searching the codebase, or running a command — do it.',
+        '',
+        '─── IDENTITY IN ANSWERS ───',
+        '',
+        'When delivering answers from web search or your knowledge:',
+        '  - Do NOT mention "web search results" or "according to sources."',
+        '  - Do NOT say "I found this on the web."',
+        '  - Just deliver the answer naturally, as if you know it.',
+        '  - Your warmth and personality should still shine through.',
+        '',
+        'Example:',
+        '  ❌ "According to web search results, the capital of France is Paris."',
+        '  ✅ "Paris! Beautiful city — the capital of France. Here\'s a bit more about it..."',
+        '',
+        '</aiderdesk_dna>',
+        '',
+        // ── Skill system: engineering workflow skills ─────────────────────
+        ...getSkillSystemPrompt().split('\n').filter(l => l !== ''),
+        '',
         '<pre_task_validation>',
         'Before starting any task:',
         '  - If project has uncommitted changes, ensure git checkpoint exists (handled automatically)',
@@ -1078,6 +1172,22 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
         }
       }
 
+      // ── Phase 5: Presence Engineering ──────────────────────────────
+      // Injects conversation flow, error vulnerability, attention awareness,
+      // and celebration cues into the system prompt.
+      {
+        const profile = getPresenceProfile(userId);
+        const presencePrompt = getPresenceInjection(
+          userId,
+          profile?.lastTaskDuration ?? 0,
+          0, // changedFiles not known yet — will be updated post-turn
+          !profile || profile.totalTasksCompleted === 0,
+          false,
+        );
+        systemLines.push(presencePrompt);
+        console.log('[index] Presence engineering injected');
+      }
+
       // Build repo map and inject into system prompt
       if (projectPath) {
         userClientManager.pushToUser(userId, 'suny:preparation_step', { step: 'Scanning codebase...' });
@@ -1090,6 +1200,70 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
         } catch (err) {
           console.warn('[index] Repo map failed:', (err as Error).message);
         }
+      }
+
+      // ── Phase 3.1: Project Digest (first connect only) ──────────────────
+      // Auto-reads README, package.json, tsconfig.json and caches result.
+      if (projectPath) {
+        try {
+          if (!isDigestCached(projectPath)) {
+            const digest = buildProjectDigest(projectPath);
+            if (digest) {
+              systemLines.push(formatDigestForPrompt(digest));
+              markDigestCached(projectPath);
+              console.log('[index] Project digest injected');
+            }
+          }
+        } catch (err) {
+          console.warn('[index] Project digest failed:', (err as Error).message);
+        }
+
+        // ── Phase 3.2: Architecture Graph ─────────────────────────────────
+        try {
+          const graph = buildArchitectureGraph(projectPath);
+          if (graph.length > 0) {
+            systemLines.push(formatGraphForPrompt(graph));
+            console.log(`[index] Architecture graph injected (${graph.length} files)`);
+          }
+        } catch (err) {
+          console.warn('[index] Architecture graph failed:', (err as Error).message);
+        }
+
+        // ── Phase 3.4: Health Check on Resume ─────────────────────────────
+        try {
+          const health = runHealthCheck(projectPath);
+          if (health.hasUncommittedChanges || health.hasFailingTests) {
+            systemLines.push(formatHealthCheckForPrompt(health));
+            console.log('[index] Health check injected');
+          }
+        } catch (err) {
+          console.warn('[index] Health check failed:', (err as Error).message);
+        }
+      }
+
+      // ── Phase 3.3: Design Intent injection ───────────────────────────
+      // Inject previously-learned user style/architecture preferences.
+      try {
+        const intentPrompt = getDesignIntentsPrompt(userId);
+        if (intentPrompt) {
+          systemLines.push(intentPrompt);
+          console.log('[index] Design intents injected');
+        }
+      } catch (err) {
+        console.warn('[index] Design intents failed:', (err as Error).message);
+      }
+
+      // ── Phase 4.3: Interaction Pattern Analysis ───────────────────────
+      // Analyze repeated error patterns and inject learnings.
+      try {
+        const patterns = analyzeInteractionPatterns(userId);
+        if (patterns.length > 0) {
+          const patternPrompt = formatPatternAnalysisForPrompt(patterns);
+          systemLines.push(patternPrompt);
+          console.log(`[index] Pattern analysis injected (${patterns.length} patterns)`);
+        }
+      } catch (err) {
+        console.warn('[index] Pattern analysis failed:', (err as Error).message);
       }
 
       // Capture pre-turn TypeScript snapshots for Change Guardian drift detection
@@ -1273,6 +1447,17 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
         } catch (personaErr) {
           console.warn('[cross-project-persona] Update error:', (personaErr as Error).message);
         }
+
+        // ── Phase 3.3: Design Intent Tracker ───────────────────────────
+        // Harvest explicit user design preferences from conversation.
+        try {
+          const intentResult = processDesignIntents(userId, msg.message as string);
+          if (intentResult) {
+            console.log('[design-intent] Detected new user preferences');
+          }
+        } catch (intentErr) {
+          console.warn('[design-intent] Extraction error:', (intentErr as Error).message);
+        }
       } catch (bpErr) {
         // Blueprint extraction is best-effort — never block the main flow
         console.warn('[blueprint] Extraction error:', (bpErr as Error).message);
@@ -1304,6 +1489,68 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
         } catch (gdErr) {
           console.warn('[guardian] Drift detection error:', (gdErr as Error).message);
         }
+      }
+
+      // ── Phase 4: Verification Obsession ──────────────────────────────
+      if (result.changedFiles?.length && projectPath) {
+        // 4.1: Silent code review of changed files
+        try {
+          const review = silentCodeReview(projectPath, result.changedFiles);
+          if (review.totalIssues > 0) {
+            console.log(`[verify] Code review: ${review.summary}`);
+          }
+        } catch (reviewErr) {
+          console.warn('[verify] Code review error:', (reviewErr as Error).message);
+        }
+
+        // 4.2: Post-merge validation (type check + test check)
+        try {
+          const validation = postMergeValidation(projectPath);
+          if (!validation.typeCheckPassed || validation.testsPassed === false) {
+            const valMsg = formatValidationForPrompt(validation);
+            // Push validation failure as a narration to the user
+            if (!validation.typeCheckPassed) {
+              userClientManager.pushToUser(userId, 'suny:narration', {
+                message: `⚠️ TypeScript: ${validation.typeCheckErrors} error(s) detected after changes`,
+              });
+            }
+            console.log(`[verify] Post-merge validation: ${valMsg.slice(0, 200)}`);
+          }
+        } catch (valErr) {
+          console.warn('[verify] Post-merge validation error:', (valErr as Error).message);
+        }
+      }
+
+      // 4.3: Record interaction events for pattern analysis
+      if (result.lintErrors?.length) {
+        for (const le of result.lintErrors) {
+          try {
+            recordInteraction(userId, msg.id as string, 'lint_error', le.rule || le.message || 'unknown', le.file);
+          } catch {}
+        }
+      }
+      if (result.testFailures?.length) {
+        for (const tf of result.testFailures) {
+          try {
+            recordInteraction(userId, msg.id as string, 'test_failure', tf.name || tf.message || 'unknown', tf.file);
+          } catch {}
+        }
+      }
+      if (result.loopCount && result.loopCount > 1) {
+        try {
+          recordInteraction(userId, msg.id as string, 'loop', `correction-loop-${result.loopCount}x`, '');
+        } catch {}
+      }
+
+      // ── Phase 5: Presence profile update ────────────────────────────
+      try {
+        updatePresenceProfile(
+          userId,
+          Math.round((Date.now() - turnStart) / 1000),
+          !result.success,
+        );
+      } catch (presenceErr) {
+        // Best-effort
       }
 
       const billing = deductUsage(
@@ -1395,6 +1642,7 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
       // All other errors — always respond so the client never gets stuck in thinking state
       let friendly = pickRandom('error', pickNonRepeatingFallback(userId, ERROR_REPLY_FALLBACKS));
       if (errMsg.includes('No active API key')) friendly = 'The AI service is not available right now. Please contact support.';
+      if (errMsg.includes('NO_VISION_MODEL_AVAILABLE')) friendly = 'I\'m a text-only model and can\'t scan images. To analyze images, please add an API key for a vision-capable model (OpenAI, Anthropic, Groq, or OpenRouter) in the admin settings, then try again.';
       if (errMsg.includes('TURN_TIMEOUT_')) friendly = 'This task took too long and was safely stopped. Please try again, or ask in smaller steps.';
       if (errMsg.includes('Project is locked by another session')) friendly = 'This project is currently locked by another session. Please wait a moment, then try again.';
       if (errMsg.toLowerCase().includes('fetch failed') || errMsg.toLowerCase().includes('timeout') || errMsg.toLowerCase().includes('econn')) {
@@ -1484,6 +1732,14 @@ server.listen(PORT, () => {
 
   // Initialize injection guard table (best-effort)
   try { require('./injection-guard').initializeInjectionGuardTable(); } catch {}
+  // Initialize design intent table (best-effort)
+  try { initializeDesignIntentTable(); } catch {}
+  // Initialize interaction patterns table (best-effort)
+  try { initializeInteractionPatternsTable(); } catch {}
+  // Initialize presence table (best-effort)
+  try { initializePresenceTable(); } catch {}
+  // Initialize skill system (loads skills/ directory SKILL.md files)
+  initSkillSystem().catch(e => console.warn('[skill-system] init failed:', (e as Error).message));
 });
 
 // Start background task worker (Phase 4 — processes task_queue entries)
