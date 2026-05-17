@@ -2,12 +2,13 @@
 import { SunyBridge } from './bridge';
 import { readConfig, updateConfig } from './config';
 
-function parseArgs(): { token?: string; server?: string; register?: string } {
+function parseArgs(): { token?: string; code?: string; server?: string; register?: string } {
   const args = process.argv.slice(2);
-  const result: { token?: string; server?: string; register?: string } = {};
+  const result: { token?: string; code?: string; server?: string; register?: string } = {};
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--token' && args[i + 1]) result.token = args[++i];
+    else if (args[i] === '--code' && args[i + 1]) result.code = args[++i];
     else if (args[i] === '--server' && args[i + 1]) result.server = args[++i];
     else if (args[i] === '--register' && args[i + 1]) result.register = args[++i];
   }
@@ -15,7 +16,35 @@ function parseArgs(): { token?: string; server?: string; register?: string } {
   return result;
 }
 
-function main(): void {
+function toHttpApiBase(server: string): string {
+  if (server.startsWith('wss://')) return `https://${server.slice(6)}`;
+  if (server.startsWith('ws://')) return `http://${server.slice(5)}`;
+  return server.replace(/\/$/, '');
+}
+
+async function redeemSetupCode(server: string, code: string): Promise<string> {
+  const apiBase = toHttpApiBase(server);
+  const response = await fetch(`${apiBase}/api/bridge/activate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code }),
+  });
+
+  let data: { token?: string; error?: string } = {};
+  try {
+    data = (await response.json()) as { token?: string; error?: string };
+  } catch {
+    // Ignore JSON parse failures and fall back to status text below.
+  }
+
+  if (!response.ok || !data.token) {
+    throw new Error(data.error || `Setup code activation failed (${response.status})`);
+  }
+
+  return data.token;
+}
+
+async function main(): Promise<void> {
   const args = parseArgs();
   const config = readConfig();
 
@@ -31,12 +60,18 @@ function main(): void {
   if (args.token) updateConfig({ token: args.token });
   if (args.server) updateConfig({ server: args.server });
 
-  const token = args.token || config.token;
+  let token = args.token || config.token;
   const server = args.server || config.server || 'wss://suny.technodel.tech';
 
+  if (!token && args.code) {
+    console.log('[SUNy Bridge] Redeeming setup code...');
+    token = await redeemSetupCode(server, args.code);
+    updateConfig({ token, server });
+  }
+
   if (!token) {
-    console.error('[SUNy Bridge] No token provided. Run with --token <JWT>');
-    console.error('  Example: suny-bridge start --token <your_token> --server wss://suny.technodel.tech');
+    console.error('[SUNy Bridge] No token provided. Run with --token <JWT> or --code <SETUP_CODE>');
+    console.error('  Example: suny-bridge start --code SUNY-XXXXX-XXXXX --server wss://suny.technodel.tech');
     process.exit(1);
   }
 
@@ -57,4 +92,7 @@ function main(): void {
   bridge.start();
 }
 
-main();
+main().catch((err) => {
+  console.error('[SUNy Bridge] Startup failed:', err instanceof Error ? err.message : String(err));
+  process.exit(1);
+});

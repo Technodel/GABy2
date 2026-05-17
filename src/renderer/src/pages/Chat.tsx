@@ -106,7 +106,7 @@ function BridgeInstallInstructions({ autoCopy = false }: { autoCopy?: boolean })
             {installerDownloaded ? 'Installer downloaded!' : 'Download one-click installer (.cmd)'}
           </button>
           <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6 }}>
-            No Node.js required. Double-click the file � it downloads the bridge and connects automatically.
+            No Node.js required. Double-click the file � it downloads the bridge and connects automatically.
           </p>
         </div>
       )}
@@ -587,6 +587,12 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
   // ── Create-from-scratch mode ─────────────────────────────────────────────
   const [newProjectMode, setNewProjectMode] = useState<'link' | 'scratch'>('link');
   const [scratchDescription, setScratchDescription] = useState('');
+
+  // ── Onboarding ───────────────────────────────────────────────────────────
+  // ── Mobile sidebar toggle ──────────────────────────────────────────────
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  function toggleSidebar() { setSidebarOpen(s => !s); }
+  function closeSidebar() { setSidebarOpen(false); }
 
   // ── Onboarding ───────────────────────────────────────────────────────────
   const [showOnboarding, setShowOnboarding] = useState<boolean>(() => {
@@ -1652,7 +1658,7 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
   const activeSpend = activeProject ? projectSpend[activeProject.id] : null;
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: 'var(--bg)' }}>
+    <div className="chat-root" style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: 'var(--bg)' }}>
       {/* Top bar */}
       <div className="topbar" style={{
         display: 'flex',
@@ -1665,12 +1671,27 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
         position: 'relative',
       }}>
         {/* LEFT: brand + username + active project */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 }}>
+          {/* Hamburger — visible only on mobile via CSS */}
+          <button
+            className="sidebar-toggle-btn"
+            onClick={toggleSidebar}
+            style={{
+              display: 'none', /* hidden on desktop */
+              background: 'none', border: 'none', color: 'var(--text-secondary)',
+              cursor: 'pointer', padding: '4px', flexShrink: 0,
+            }}
+            title="Toggle sidebar"
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" />
+            </svg>
+          </button>
           <img src="/SLOGO.png" alt="SUNy" style={{ width: 36, height: 36, borderRadius: '50%', objectFit: 'cover', flexShrink: 0 }} />
           <span className="suny-logo" style={{ fontWeight: 700, fontSize: 16, color: 'var(--accent)', marginRight: 2 }}>SUNy</span>
-          <span style={{ fontSize: 11, color: 'var(--text-muted)', fontStyle: 'italic', opacity: 0.75, whiteSpace: 'nowrap' }}>Consider it done.</span>
+          <span className="topbar-tagline" style={{ fontSize: 11, color: 'var(--text-muted)', fontStyle: 'italic', opacity: 0.75, whiteSpace: 'nowrap' }}>Consider it done.</span>
           {userData?.username && (
-            <span style={{
+            <span className="topbar-username" style={{
               fontSize: 11, color: 'var(--text-secondary)',
               background: 'var(--surface)', border: '1px solid var(--border)',
               borderRadius: 999, padding: '2px 8px', whiteSpace: 'nowrap',
@@ -1764,8 +1785,12 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
 
       {/* Body */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden', minHeight: 0 }}>
+        {/* Sidebar overlay backdrop — only shown on mobile when sidebar is open */}
+        {sidebarOpen && (
+          <div className="sidebar-overlay" onClick={closeSidebar} style={{ display: 'none' }} />
+        )}
         {/* Projects sidebar */}
-        <div style={{
+        <div className={`sidebar${sidebarOpen ? ' sidebar-open' : ''}`} style={{
           width: 220,
           borderRight: '1px solid var(--border)',
           display: 'flex',
@@ -2246,9 +2271,9 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
         </div>
 
         {/* Chat area */}
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minHeight: 0 }}>
+        <div className="chat-main" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minHeight: 0 }}>
           {/* Messages */}
-          <div style={{ flex: 1, overflow: 'auto', padding: '20px 24px' }}>
+          <div className="chat-messages-area" style={{ flex: 1, overflow: 'auto', padding: '20px 24px' }}>
         {messages.length > 0 && (
           <button
             className="btn btn-icon btn-secondary btn-sm"

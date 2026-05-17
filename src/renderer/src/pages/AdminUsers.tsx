@@ -108,7 +108,7 @@ export default function AdminUsers() {
         </button>
       </div>
 
-      <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+      <div className="card table-responsive" style={{ padding: 0, overflow: 'auto' }}>
         <table>
           <thead>
             <tr>

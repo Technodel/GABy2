@@ -243,7 +243,7 @@ export default function AdminUsageStats() {
 
       {/* ── By User ─────────────────────────────────────────────────────────── */}
       {tab === 'user' && (
-        <div className="card" style={{ padding: 0, overflow: 'auto', borderTopLeftRadius: 0, borderTopRightRadius: 0 }}>
+        <div className="card table-responsive" style={{ padding: 0, overflow: 'auto', borderTopLeftRadius: 0, borderTopRightRadius: 0 }}>
           <table style={{ fontSize: 13, minWidth: 800 }}>
             <thead>
               <tr>

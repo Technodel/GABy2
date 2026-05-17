@@ -1,7 +1,7 @@
 /**
  * GABy Agent Loop -- uses Vercel AI SDK streamText with native tool calling.
  *
- * Architecture (same as AiderDesk):
+ * Architecture:
  *   streamText({ model, tools, maxSteps }) handles the full agentic loop:
  *     1. AI generates text and/or tool calls (native JSON, NOT XML in text)
  *     2. SDK auto-executes tool.execute() for each call

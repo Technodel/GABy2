@@ -12,7 +12,7 @@ interface ApiKey {
   model_id_override: string | null;
 }
 
-const PROVIDERS = ['Anthropic', 'DeepSeek', 'Groq', 'OpenRouter', 'OpenAI', 'Gemini', 'OpenAI-compatible', 'Mistral', 'Cohere', 'Together', 'Perplexity'];
+const PROVIDERS = ['Anthropic', 'DeepSeek', 'Groq', 'OpenRouter', 'OpenAI', 'Gemini', 'Ollama', 'OpenAI-compatible', 'HuggingFace', 'Mistral', 'Cohere', 'Together', 'Perplexity'];
 const MODES = [
   { value: 'free', label: '⚡ Free Mode' },
   { value: 'fast', label: '🚀 Fast Mode' },
@@ -78,7 +78,7 @@ export default function AdminApiKeys() {
         Each mode (Free / Fast / Pro) should have exactly one active key. Adding a new key for a mode deactivates the previous one automatically.
       </div>
 
-      <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+      <div className="card table-responsive" style={{ padding: 0, overflow: 'auto' }}>
         <table>
           <thead>
             <tr>
@@ -160,15 +160,31 @@ export default function AdminApiKeys() {
                 </div>
               </div>
               <div>
-                <label style={{ fontSize: 12, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>API Key</label>
+                <label style={{ fontSize: 12, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>
+                  {provider === 'Ollama' ? 'Ollama Base URL'
+                    : provider === 'OpenAI-compatible' ? 'Endpoint Base URL'
+                    : provider === 'HuggingFace' ? 'HF Access Token'
+                    : 'API Key'}
+                </label>
                 <input
-                  type="password"
+                  type={provider === 'Ollama' || provider === 'OpenAI-compatible' || provider === 'HuggingFace' ? 'text' : 'password'}
                   value={keyValue}
                   onChange={e => setKeyValue(e.target.value)}
-                  placeholder="Paste API key here"
+                  placeholder={provider === 'Ollama' ? 'http://localhost:11434/v1'
+                    : provider === 'OpenAI-compatible' ? 'http://localhost:8000/v1'
+                    : provider === 'HuggingFace' ? 'hf_xxxxxxxxxxxxxxxxxxxxxxxx'
+                    : 'Paste API key here'}
                   autoComplete="off"
                 />
-                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>Stored securely. Never shown again after saving.</div>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+                  {provider === 'Ollama'
+                    ? 'Default: http://localhost:11434/v1. Change if Ollama is on a different host/port.'
+                    : provider === 'OpenAI-compatible'
+                    ? 'Your custom model endpoint (vLLM, TGI, llama.cpp, etc.)'
+                    : provider === 'HuggingFace'
+                    ? 'Free HF Inference API — get a token at huggingface.co/settings/tokens. Set model override to your HF model name.'
+                    : 'Stored securely. Never shown again after saving.'}
+                </div>
               </div>
             </div>
             <div style={{ display: 'flex', gap: 8, marginTop: 20, justifyContent: 'flex-end' }}>

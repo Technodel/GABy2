@@ -1,5 +1,6 @@
 import { Link, Outlet, useLocation } from 'react-router-dom';
-import { Users, Key, DollarSign, BarChart2, Phone, Settings, LogOut } from 'lucide-react';
+import { Users, Key, DollarSign, BarChart2, Phone, Settings, LogOut, Menu, X } from 'lucide-react';
+import { useState } from 'react';
 
 const NAV_ITEMS = [
   { path: '/admin/users', icon: Users, label: 'Users' },
@@ -16,6 +17,9 @@ interface AdminPanelProps {
 
 export default function AdminPanel({ onLogout }: AdminPanelProps) {
   const location = useLocation();
+  const [adminSidebarOpen, setAdminSidebarOpen] = useState(false);
+
+  function closeSidebar() { setAdminSidebarOpen(false); }
 
   async function handleLogout() {
     await fetch('/admin/logout', { method: 'POST', credentials: 'include' });
@@ -23,9 +27,36 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
   }
 
   return (
-    <div style={{ display: 'flex', height: '100vh', background: 'var(--bg)' }}>
+    <div className="admin-layout" style={{ display: 'flex', height: '100vh', background: 'var(--bg)' }}>
+      {/* Mobile overlay */}
+      {adminSidebarOpen && (
+        <div
+          className="sidebar-overlay"
+          onClick={closeSidebar}
+          style={{
+            display: 'none', /* shown on mobile via CSS override in media query */
+          }}
+        />
+      )}
+
+      {/* Sidebar toggle (hamburger) — visible only on mobile */}
+      <button
+        className="admin-hamburger"
+        onClick={() => setAdminSidebarOpen(s => !s)}
+        style={{
+          display: 'none', /* hidden on desktop */
+          position: 'fixed', top: 10, left: 10, zIndex: 201,
+          background: 'var(--surface)', border: '1px solid var(--border)',
+          borderRadius: 'var(--radius-sm)', color: 'var(--text-secondary)',
+          cursor: 'pointer', padding: '8px',
+        }}
+        title="Toggle sidebar"
+      >
+        {adminSidebarOpen ? <X size={18} /> : <Menu size={18} />}
+      </button>
+
       {/* Sidebar */}
-      <div style={{
+      <div className={`admin-sidebar${adminSidebarOpen ? ' admin-sidebar-open' : ''}`} style={{
         width: 200,
         borderRight: '1px solid var(--border)',
         display: 'flex',
@@ -47,6 +78,7 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
             <Link
               key={item.path}
               to={item.path}
+              onClick={closeSidebar}
               style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -77,7 +109,7 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
       </div>
 
       {/* Content */}
-      <div style={{ flex: 1, overflow: 'auto', padding: 28 }}>
+      <div className="admin-content" style={{ flex: 1, overflow: 'auto', padding: 28 }}>
         <Outlet />
       </div>
     </div>

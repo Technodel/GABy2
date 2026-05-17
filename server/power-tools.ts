@@ -1,8 +1,8 @@
 /**
- * GABy Power Tools -- AiderDesk's tool logic adapted for GABy's bridge architecture.
+ * GABy Power Tools -- adapted from the original codebase for GABy's bridge architecture.
  *
  * Tools execute via the user's bridge (remote file system on their machine).
- * Extracted from AiderDesk's src/main/agent/tools/power.ts with:
+ * Extracted from the original implementation with:
  *   - task.* replaced by direct bridge calls
  *   - approvalManager removed (auto-approve in server mode)
  *   - filterIgnoredFiles removed (bridge handles sandboxing)
@@ -41,7 +41,7 @@ function withFileLock<T>(filePath: string, operation: () => Promise<T>): Promise
   return next;
 }
 
-/** Sanitize escape sequences from AiderDesk model output */
+/** Sanitize escape sequences from model output */
 function sanitizeEscapes(str: string): string {
   const hasSingle = /\\[nrt"'](?!\\)/.test(str);
   if (hasSingle) return str;
@@ -93,7 +93,7 @@ export function createPowerTools(ctx: PowerToolContext): ToolSet {
     },
   });
 
-  // file_edit -- AiderDesk's search/replace, executed server-side after reading from bridge
+  // file_edit -- search/replace, executed server-side after reading from bridge
   const fileEditTool = tool({
     description: `Edit a file by replacing an exact string with new text.
 EXACTLY MATCH the existing content, character for character, including whitespace, comments, etc.
@@ -230,7 +230,7 @@ Modes: 'create_only' (fail if exists), 'overwrite' (replace or create), 'append'
     },
   });
 
-  // bash (AiderDesk's bashTool equivalent)
+  // bash (shell command execution)
   const bashTool = tool({
     description: 'Execute a shell command in the project directory.',
     inputSchema: z.object({

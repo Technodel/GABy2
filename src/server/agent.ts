@@ -8,6 +8,8 @@
  *   OpenRouter     -> @ai-sdk/openai-compatible
  *   OpenAI         -> @ai-sdk/openai
  *   Gemini         -> @ai-sdk/openai-compatible (OpenAI-compat endpoint)
+ *   Ollama         -> @ai-sdk/openai-compatible (local models via Ollama)
+ *   HuggingFace    -> @ai-sdk/openai-compatible (free Inference API, no paid server needed)
  *
  * Per-mode fallback: keys sorted by priority (1=primary, 2=fallback ...).
  */
@@ -97,6 +99,24 @@ export function buildLanguageModel(key: KeyEntry, modelId: string): LanguageMode
         name: 'gemini',
         baseURL: GEMINI_BASE_URL,
         apiKey: key_value,
+      })(modelId);
+    case 'Ollama':
+      return createOpenAICompatible({
+        name: 'ollama',
+        baseURL: key_value || 'http://localhost:11434/v1',
+        apiKey: 'ollama', // Ollama doesn't require API key auth by default
+      })(modelId);
+    case 'OpenAI-compatible':
+      return createOpenAICompatible({
+        name: 'custom',
+        baseURL: key_value || 'http://localhost:8000/v1',
+        apiKey: 'not-needed', // local/self-hosted endpoint, auth optional
+      })(modelId);
+    case 'HuggingFace':
+      return createOpenAICompatible({
+        name: 'huggingface',
+        baseURL: 'https://api-inference.huggingface.co/v1/',
+        apiKey: key_value, // HF access token from huggingface.co/settings/tokens
       })(modelId);
     default:
       return createOpenAI({ apiKey: key_value })(modelId);
