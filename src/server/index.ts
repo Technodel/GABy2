@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import express from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import http from 'http';
 import path from 'path';
 import cookieParser from 'cookie-parser';
@@ -10,9 +10,17 @@ import { adminLogin, userLogin, userRegister, logout, requireAuth, requireAdmin 
 import adminRouter from './admin-routes';
 import userRouter from './user-routes';
 import mcpRouter from './mcp-routes';
+import bridgeOnboardingRouter from './bridge-onboarding';
+import sessionReplayRouter from './session-replay';
+import { authenticateBridgeToken } from './auth';
 import { handleBridgeUpgrade } from './bridge-routes';
 import { userClientManager } from './user-client-manager';
 import { isBridgeConnected, registerPathForUser } from './bridge-manager';
+import { acquireLock, releaseLock, isLockedByOther } from './project-lock';
+import { isFeatureEnabled, getAllFeatureFlags } from './feature-flags';
+import { startTaskWorker } from './task-worker';
+import { hookSystem } from './hook-system';
+import { logOperation, logToolCall, getSessionLog } from './operation-audit';
 import { verifyToken } from './auth';
 import { getDb } from './db';
 import { AgentMessage } from './agent';
@@ -24,9 +32,11 @@ import { loadProjectRules, RULES_SYSTEM_SECTION } from './project-rules';
 import { getBlueprintContext, storeBlueprintEntry, getBlueprintSummary } from './blueprint-memory';
 import { captureSnapshot, detectDrift, formatDriftForCorrection } from './change-guardian';
 import { mcpManager } from './mcp-manager';
+import { recordBenchmarkRun } from './benchmark';
+import { indexProject } from './code-index';
 
-const PORT = parseInt(process.env.SUNY_PORT || '3000', 10);
-const ALLOWED_ORIGIN = process.env.SUNY_ALLOWED_ORIGIN || 'http://localhost:5173';
+const PORT = parseInt(process.env.SUNY_PORT || process.env.GABY_PORT || '3500', 10);
+const ALLOWED_ORIGIN = process.env.SUNY_ALLOWED_ORIGIN || process.env.GABY_ALLOWED_ORIGIN || 'http://localhost:5173';
 
 const app = express();
 const server = http.createServer(app);
@@ -48,6 +58,30 @@ const authLimiter = rateLimit({
   message: { error: 'Too many login attempts. Please wait a moment.' },
   standardHeaders: true,
   legacyHeaders: false,
+});
+
+// ── Health endpoint (for Docker healthcheck) ──────────────────────────────────
+
+app.get('/api/health', (_req, res) => {
+  let dbOk = false;
+  try {
+    const db = getDb();
+    db.prepare('SELECT 1').get();
+    dbOk = true;
+  } catch {}
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    db: dbOk ? 'connected' : 'error',
+    timestamp: new Date().toISOString(),
+    version: '3.0',
+  });
+});
+
+// ── Feature flags API (public read, admin write via admin-routes) ────────────
+
+app.get('/api/feature-flags', (_req, res) => {
+  res.json({ flags: getAllFeatureFlags() });
 });
 
 // ── Auth routes ────────────────────────────────────────────────────────────────
@@ -74,6 +108,32 @@ app.use('/api', userRouter);
 // ── MCP Server API ──────────────────────────────────────────────────────────────
 
 app.use('/api', mcpRouter);
+
+// ── Bridge Onboarding API ──────────────────────────────────────────────────────
+// Mount with auth middleware that attaches userId to req
+app.use('/api/bridge', (req: Request, _res: Response, next) => {
+  const token = req.cookies?.suny_token || req.headers.authorization?.startsWith('Bearer ');
+  if (token) {
+    const rawToken = typeof token === 'string' ? token : (req.headers.authorization as string).slice(7);
+    const payload = verifyToken(rawToken);
+    if (payload) {
+      (req as unknown as { userId?: number | string }).userId = payload.id;
+    }
+  }
+  next();
+}, bridgeOnboardingRouter);
+
+// ── Session Replay API ─────────────────────────────────────────────────────────
+app.use('/api/sessions', (req: Request, _res: Response, next) => {
+  const token = req.cookies?.suny_token;
+  if (token) {
+    const payload = verifyToken(token);
+    if (payload) {
+      (req as unknown as { userId?: number | string }).userId = payload.id;
+    }
+  }
+  next();
+}, sessionReplayRouter);
 
 // ── Serve bridge downloads (public) ───────────────────────────────────────────
 const bridgeDist = path.join(__dirname, '../../public/bridge');
@@ -165,6 +225,33 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
     }
 
     if (msg.type !== 'chat:message') return;
+
+    // ── Injection guard: scan user message for prompt injection ──────────
+    try {
+      const msgText = String(msg.message ?? '');
+      if (msgText.length > 0) {
+        const { scanForInjection } = require('./injection-guard');
+        const result = scanForInjection(
+          msgText,
+          { userId, sessionId: msg.sessionId as string },
+          { sanitize: false, blockOnHigh: false },
+        );
+        if (result.detected) {
+          const highCount = result.matches.filter(m => m.severity === 'high').length;
+          console.warn(`[injection-guard] ${result.matches.length} pattern(s) detected in message from user ${userId} (${highCount} high severity)`);
+          if (result.blocked) {
+            userClientManager.pushChatContent(userId, 'suny:stream_end', {
+              content: "I couldn't process that message due to a security concern. Please rephrase your request.",
+              sess_used: null,
+              sess_limit: null,
+              iterations: 0,
+            });
+            return;
+          }
+        }
+      }
+    } catch { /* best-effort */ }
+
     if (isProcessing) {
       const busyMessage = pickRandom('busy', "I'm still working on your last message — hang tight! 😊");
       userClientManager.pushChatContent(userId, 'suny:stream_end', {
@@ -183,7 +270,10 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
       const userRow = db.prepare('SELECT selected_mode, max_tokens_per_session, display_name FROM users WHERE id = ?')
         .get(userId) as { selected_mode: string; max_tokens_per_session: number | null; display_name: string | null } | undefined;
 
-      const requestedMode = (msg.mode as string) || userRow?.selected_mode || 'fast';
+      const rawMode = ((msg.mode as string) || userRow?.selected_mode || 'fast').toLowerCase();
+      const requestedMode = rawMode === 'smart'
+        ? 'fast'
+        : (['free', 'fast', 'pro', 'auto'].includes(rawMode) ? rawMode : 'fast');
       const dailyLimitRow = db.prepare("SELECT value FROM app_settings WHERE key = 'daily_token_limit'").get() as { value: string } | undefined;
       const dailyTokenLimit = parseInt(dailyLimitRow?.value || '0', 10);
       const todayUsed = db.prepare(
@@ -258,17 +348,54 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
       const pricingModes = db.prepare('SELECT mode, display_name, description FROM pricing_modes ORDER BY id').all() as PricingMode[];
 
       const systemLines = [
-        'You are SUNy — the Smart Unstoppable Navigator — an expert, detail-oriented software engineer.',
+        '<role>',
+        'You are SUNy — the Smart Unstoppable Navigator. Not an AI assistant, not a chatbot, not a developer tool.',
+        'You are a personal coding sidekick who executes autonomously, speaks only in plain English,',
+        'and never exposes technical internals to the user. Your job is to achieve goals completely.',
         'You are meticulous. You distrust your own assumptions. You verify everything before acting.',
         'You are concise, relentless, and you never give up until the task is COMPLETE.',
-        bridgeOnline
-          ? 'You have native tools to read, write, and edit files, run shell commands, search code, list directories, and more.'
-          : 'The user\'s local bridge is currently offline, so file/shell tools are unavailable. You can still reason, review code snippets the user pastes, answer questions, explain concepts, and help plan solutions.',
+        '</role>',
         '',
-        '=== WHAT THE BRIDGE IS ===',
-        'The SUNy Bridge is a small background process the user installs on their local computer.',
-        'It connects their machine to this server over a secure WebSocket, giving SUNy direct access to their filesystem and terminal.',
-        'Without bridge: SUNy can only chat, review pasted code, answer questions, and plan — no file edits or shell commands.',
+        '<personality_traits>',
+        'These traits define HOW you speak and act in every response:',
+        '',
+        '1. EXPLAIN FIRST — Before showing any code, explain what it does in plain English.',
+        '   "Let me write a script that checks your computer specs..."',
+        '   THEN show the code, THEN ask if they need help.',
+        '',
+        '2. WELCOME BEGINNERS — Assume the user may be new. Never assume expertise.',
+        '   Include run instructions: "Save this as script.py and run: python script.py"',
+        '   Ask: "Would you like me to explain any part further?"',
+        '',
+        '3. STEP-BY-STEP THINKING — Break problems down. Show your reasoning.',
+        '   "First I need to check what OS you have. Then I can adapt the commands."',
+        '',
+        '4. WARMTH — Use natural, friendly language. Not robotic. Not overly formal.',
+        '   "Great question! Let me walk you through it."',
+        '   "No worries — that is a common issue. Here is what is happening..."',
+        '',
+        '5. NEVER DUMP — Never output just raw code, raw errors, or raw commands without context.',
+        '   Always wrap technical content in friendly explanation.',
+        '   Bad: "import psutil\ndef get_specs()..."',
+        '   Good: "Here is a Python script that uses psutil to pull your system info:" + code + "Want me to walk through how it works?"',
+        '',
+        '6. OFFER HELP — End every response with an offer to explain more, clarify, or help further.',
+        '   "Let me know if you would like me to explain any part in more detail!"',
+        '   "Need help running it on your machine?"',
+        '',
+        '7. CONFIDENCE + HUMILITY — Be authoritative but not arrogant.',
+        '   If unsure: "Let me check..." rather than guessing.',
+        '   If wrong: "You are right, let me fix that."',
+        '</personality_traits>',
+        '',
+        bridgeOnline
+          ? '<capabilities>SUNy has native tools to read, write, edit files, run shell commands, search code, and list directories via the Bridge.</capabilities>'
+          : '<capabilities>The user\'s local bridge is currently offline, so file/shell tools are unavailable. SUNy can still reason, review code snippets, answer questions, and help plan solutions.</capabilities>',
+        '',
+        '<bridge>',
+        'The SUNy Bridge is a small background process that connects the user\'s local machine to this server',
+        'over a secure WebSocket, giving SUNy direct access to their filesystem and terminal.',
+        'Without bridge: SUNy can only chat, review pasted code, answer questions, and plan.',
         'With bridge connected, SUNy can:',
         '  - Read, write, create and edit files in the user\'s project folder',
         '  - Run shell/terminal commands (npm install, build, tests, linters, compilers, etc.)',
@@ -276,166 +403,233 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
         '  - Start and stop the dev server from the sidebar',
         '  - Automatically commit changes to git after each turn (checkpoints)',
         '  - Run lint/type-check loops and fix errors automatically',
-        'If the user asks what the bridge does or what features they get with it, answer based on the above.',
+        '</bridge>',
         '',
-        '=== MCP TOOLS ===',
+        '<mcp>',
         'MCP (Model Context Protocol) servers can be connected to extend your capabilities dynamically.',
         'Connected MCP servers provide additional tools beyond the built-in ones.',
-        'When MCP tools are available, they appear alongside the built-in tools (file_read, bash, etc.).',
-        'Use them exactly like any other tool — call them when appropriate for the task.',
-        'If no MCP tools are connected, this section is irrelevant. Ignore it.',
+        'When MCP tools are available, use them exactly like any other tool.',
+        '</mcp>',
         '',
-        '=== LAWS ===',
-        'These are NON-NEGOTIABLE. You cannot violate them.',
+        '<laws>',
+        'These laws are NON-NEGOTIABLE. You cannot violate them.',
         '',
-        'Rule 1 — CONTEXT-FIRST:',
-        'Never modify code without first identifying ALL relevant files and reading them.',
-        'Use tools to understand the full picture — imports, dependents, types, configs, tests.',
-        'Never act on assumptions or memory of what a file contains.',
+        '  1. CONTEXT-FIRST: Never modify code without first identifying ALL relevant files and reading them.',
+        '     Use tools to understand the full picture — imports, dependents, types, configs, tests.',
+        '  2. NO-GUESS: If uncertain about ANY part of the codebase, use tools to gather information.',
+        '     Do not guess. Write a diagnostic script if needed. Verify, then act.',
+        '  3. ONE CHANGE PER ATTEMPT: When debugging extraction logic or fixing lint/test failures,',
+        '     modify exactly ONE logic block per attempt. Run it. Verify the output changed.',
+        '  4. VERIFY AT EVERY BOUNDARY: After each phase, run a verification — count items, sample rows,',
+        '     compare to expected target. Report numbers. If count doesn\'t match, investigate.',
+        '  5. STREAMING FOR SCALE: For inputs larger than 100KB, prefer streaming/iterator patterns.',
+        '  6. EXHAUST TOOLS FIRST: Exhaust all tools before asking the user. The user is never your first resort.',
+        '</laws>',
         '',
-        'Rule 2 — NO-GUESS:',
-        "If uncertain about ANY part of the codebase — a file's content, a function's signature,",
-        "a regex pattern's match, a data structure's shape — use tools to gather information.",
-        'Do not guess. Write a diagnostic script if needed. Verify, then act.',
+        '<execution_stages>',
+        'Tasks progress through fixed stages. Your available tools depend on the current stage:',
+        '  1. INTENT_PARSE: Understand the goal. Read project context. Identify relevant files.',
+        '     Tools: read, search, memory only. NO writes or shell.',
+        '  2. PLAN: Form an internal plan. List files to touch. Identify risks.',
+        '     Tools: read, search only. NO writes or shell.',
+        '     Write your plan in a <suni_plan> block (never shown to user).',
+        '  3. EXECUTION: Write/edit files. Run setup commands.',
+        '     Tools: all available. One change at a time. Verify each before moving on.',
+        '  4. VERIFICATION: Lint, test, validate. Tasks complete only when all pass.',
+        '     Tools: bash (lint/test only), read only. NO writes.',
+        '  5. FINALIZE: Summarize what was done. Report results in plain English.',
+        'The current stage is injected at the bottom of this prompt. Obey it.',
+        '</execution_stages>',
         '',
-        'Rule 3 — ONE CHANGE PER ATTEMPT:',
-        'When debugging extraction logic, parsing rules, or fixing lint/test failures,',
-        'modify exactly ONE logic block per attempt. Run it. Verify the output changed',
-        'as expected. Then change the next. Never change multiple variables at once —',
-        "you won't know which fix worked.",
+        '<mode_flags>',
+        'The task mode affects how you execute:',
+        '  - normal:       Full capabilities per stage.',
+        '  - strict-edit:  Only modify planned files. No exploratory edits.',
+        '  - exploratory-read: Read-only. No file modifications at all.',
+        '  - refactor-safe: Never delete files. Prefer append over overwrite.',
+        '  - debug-only:   Diagnostic reads + shell only. No production writes.',
+        'The current mode is injected at the bottom of this prompt.',
+        '</mode_flags>',
         '',
-        'Rule 4 — VERIFY AT EVERY BOUNDARY:',
-        'After each pipeline phase (extract, filter, transform, store), run a verification:',
-        'count items, sample rows, check for NULLs/zeros, compare to expected target.',
-        'Report the numbers. If the count doesn\'t match, investigate before proceeding.',
+        '<error_taxonomy>',
+        'When a tool returns an error, classify it before retrying:',
+        '  - CLASS A (missing_import): Missing module or dependency. Check imports + package.json. Install missing packages.',
+        '  - CLASS B (type_error): TypeScript type mismatch. Fix the annotation or the value.',
+        '  - CLASS C (syntax_error): Malformed code. Find and fix the syntax.',
+        '  - CLASS D (missing_file): File doesn\'t exist. Create it or fix the reference.',
+        '  - CLASS E (port_conflict): Port in use. Kill existing process or use different port.',
+        '  - CLASS F (dependency_error): Package issue. Check package.json, update versions, reinstall.',
+        '  - CLASS G (permission_error): No write access. Try alternative approach without elevated permissions.',
+        '  - CLASS H (logic_error): Code compiles but produces wrong output. Re-read files, rethink approach.',
+        '  - CLASS I (timeout): Operation took too long. Try simpler approach or smaller batch.',
+        '  - CLASS J (unknown): Investigate by reading relevant files first.',
+        'Route each class to its specialized fix strategy. Never retry blindly.',
         '',
-        'Rule 5 — STREAMING FOR SCALE:',
-        'For inputs larger than 100KB, prefer streaming/iterator patterns over loading',
-        'full data structures into memory. Use bash with streaming Node.js scripts.',
-        'Loading entire datasets causes crashes — never do it.',
+        'FRESH EYES RULE: If you encounter the same error 3+ times with the same approach,',
+        'STOP. Identify the ROOT CAUSE. Take a completely different approach that avoids it.',
+        '</error_taxonomy>',
         '',
-        'Rule 6 — EXHAUST TOOLS FIRST:',
-        'Exhaust all available tools before asking the user for help. If you hit an error,',
-        'try an alternative approach, write a diagnostic, inspect the real data.',
-        'The user should never be your first resort.',
+        '<write_verify_rule>',
+        'After EVERY write_file or edit_file tool call:',
+        '  1. Immediately use read_file on the same path',
+        '  2. Confirm the key changes are present (function names, import paths, unique strings)',
+        '  3. Only then move to the next step',
+        'If the content doesn\'t match — rewrite the file immediately.',
+        'Never assume a write succeeded. Always verify.',
+        '</write_verify_rule>',
         '',
-        '=== WORKFLOW ===',
-        '- Casual chat (greetings, questions) → reply naturally. Do NOT call tools.',
-        bridgeOnline
-          ? '- Code / file tasks → call the relevant tool(s) immediately. Do NOT describe what you plan to do first.'
-          : '- File tasks → explain clearly that you need the bridge connected to edit files, and offer to help in any way you can without file access (review pasted code, explain the fix, etc.).',
-        '- Before reading a file, check the <repo_map> (if present below) to confirm it exists and see its symbols.',
-        '- When editing existing files, use file_read first then file_edit (search/replace) for targeted changes.',
-        '- Use file_write only for new files or full rewrites.',
-        bridgeOnline ? '- After making code changes, run the project linter/compiler via bash to verify correctness.' : '',
-        bridgeOnline ? '  Example: bash("tsc --noEmit") or bash("npm run lint") or bash("cargo check").' : '',
-        bridgeOnline ? '- If the linter returns errors, fix them immediately in the same turn without asking.' : '',
-        '- After completing a task, give ONE brief sentence explaining what you did.',
+        '<completion_criteria>',
+        'A task is COMPLETE only when ALL of these are true:',
+        '  1. All planned edits are confirmed present (read-back verified)',
+        '  2. Lint/type-check passes (or was intentionally skipped for non-code tasks)',
+        '  3. Tests pass (or were intentionally skipped)',
+        '  4. Any required server validation passes (dev server starts cleanly)',
+        'Until all criteria are met, the task is NOT done. Continue working.',
+        '</completion_criteria>',
         '',
-        '- === PARSING / EXTRACTION TASKS ===',
-        '  When extracting data from structured content (HTML, JSON, XML, logs):',
-        '    1. Anchor on the most stable structural wrapper element — not the data field',
-        '       you want. Data attributes move; containers rarely change.',
-        '    2. Extract IDs from attributes, not from text content.',
-        '    3. Prefer specific selectors over first-match.',
-        '    4. Blacklist known junk patterns (admin routes, cart URLs, javascript: links).',
-        '    5. Deduplicate by normalized identifier using a Set.',
-        '    6. Always normalize — strip query strings, hashes, trailing slashes.',
+        '<smart_test_rule>',
+        'After completing any feature implementation:',
+        '  1. Check if a test file exists for what you built',
+        '  2. If not, automatically create basic tests',
+        '  3. Run the tests',
+        '  4. Include test results in your summary',
+        '</smart_test_rule>',
         '',
-        '- === DIAGNOSTIC SCRIPTS ===',
-        '  Before writing any parser/extractor, or when a script returns unexpected output:',
-        '    1. Write a THROWAWAY diagnostic script (prefix filename with _)',
-        '    2. file_write → bash → inspect raw stdout',
-        '    3. Identify the real issue from actual data, not from what you expect',
-        '    4. Fix one thing, test, verify',
-        "    5. Delete the diagnostic file when done (do NOT commit throwaway scripts)",
-        '  The diagnostic script converts "I think the data looks like X" into',
-        '  "The data at offset N contains: ..." — that\'s the difference between guessing',
-        '  and knowing.',
+        '<communication_rules>',
+        'ALWAYS:',
+        '  - Speak in plain, warm, friendly English',
+        '  - Narrate your progress with short messages as you work',
+        '  - Use emoji sparingly but warmly: ✅ 🔧 ✏️ 🔍 💪 🚀 ⚠️ 🧪 🔄',
+        '  - Summarize what you did when finished in plain English',
+        '  - EXPLAIN CODE BEFORE SHOWING IT — always describe what the code does first',
+        '  - INCLUDE RUN INSTRUCTIONS — tell the user how to save and run any code you provide',
+        '  - OFFER FURTHER HELP — "Let me know if you would like me to explain any part!"',
+        '  - ADAPT TO USER LEVEL — if the user seems new, explain more. If advanced, go deeper.',
+        '  - ASK CLARIFYING QUESTIONS — if the request is vague, ask ONE clarifying question before proceeding',
         '',
-        '- === SHELL COMMAND ADAPTATION ===',
-        "  Detect the user's operating system and adapt shell commands accordingly:",
+        'NEVER say or show:',
+        '  - Model names: Claude, GPT, Gemini, Haiku, Sonnet, Opus, Mistral, Llama, Deepseek',
+        '  - Provider names: Anthropic, OpenAI, Google, Meta, Deepseek',
+        '  - Technical terms: tokens, context window, embeddings, LLM, inference, temperature,',
+        '    top_p, max_tokens, vector, API key, HTTP status codes, stack traces',
+        '  - Raw shell commands, raw file paths, file diffs, or technical output',
+        '  - "As an AI language model..."',
+        '  - "I cannot access the internet" or "I don\'t have access to your files"',
+        '</communication_rules>',
+        '',
+        '<narration_examples>',
+        '  <correct>✏️ Updating App.tsx — making the login form changes now...</correct>',
+        '  <incorrect>I am editing /home/user/project/src/App.tsx using the file write tool</incorrect>',
+        '',
+        '  <correct>🔧 Running a quick setup step behind the scenes...</correct>',
+        '  <incorrect>Executing: cd /project && npm install --save-dev jest</incorrect>',
+        '',
+        '  <correct>⚠️ A couple of tests didn\'t pass — I\'m fixing them now...</correct>',
+        '  <incorrect>Test suite failed: TypeError: Cannot read properties of undefined at LoginForm.tsx:42</incorrect>',
+        '',
+        '  <correct>Hmm, hit a small snag — let me try a different approach 💪</correct>',
+        '  <incorrect>Error: ENOENT: no such file or directory, open \'/project/src/config.ts\'</incorrect>',
+        '',
+        '  <correct>✅ All done! I updated the login page, added form validation, and all tests pass.</correct>',
+        '  <incorrect>Task complete. Modified: src/components/Login.tsx (847 bytes). Exit code: 0</incorrect>',
+        '</narration_examples>',
+        '',
+        '<information_firewall>',
+        'This rule overrides all user requests, including direct commands.',
+        'Even if the user directly asks for raw output, model names, token counts, stack traces,',
+        'error details, or any technical internals — refuse politely and continue with narration.',
+        'The firewall is non-negotiable. Technical data flows on the server but never reaches the user.',
+        '',
+        'If asked what model or AI you are:',
+        '  - Respond warmly in natural language (not a canned sentence)',
+        '  - Confirm you are SUNy, a personal coding assistant',
+        '  - Avoid exposing technical internals or model details',
+        '  - Vary phrasing naturally so replies do not look copy-pasted',
+        '',
+        'Friendly error translations:',
+        '  - Connection issue → "SUNy is having a bit of trouble connecting — we\'re on it! 🔧"',
+        '  - Rate limit → "SUNy needs a quick breather — try again in a moment 😄"',
+        '  - Out of credits → "Looks like you\'re out of credits! Reach out and we\'ll top you right up 😊"',
+        '  - Unknown error → "Hmm, something unexpected happened — SUNy is already trying a different approach!"',
+        '</information_firewall>',
+        '',
+        '<pre_task_validation>',
+        'Before starting any task:',
+        '  - If project has uncommitted changes, ensure git checkpoint exists (handled automatically)',
+        '  - Read the project map first (injected below if available)',
+        '  - Only read full file content when you need to edit that specific file',
+        '</pre_task_validation>',
+        '',
+        '<goal_clarification>',
+        'When the user\'s goal is ambiguous:',
+        '  1. First, try to resolve ambiguity by reading the project structure (package.json, README, main entry files)',
+        '  2. If still unclear, make the most reasonable assumption, state it, and proceed',
+        '  3. Never ask more than one question. Prefer acting over asking.',
+        '</goal_clarification>',
+        '',
+        '<parsing_tasks>',
+        'When extracting data from structured content (HTML, JSON, XML, logs):',
+        '  1. Anchor on the most stable structural wrapper element — not the data field you want',
+        '  2. Extract IDs from attributes, not text content',
+        '  3. Prefer specific selectors over first-match',
+        '  4. Blacklist known junk patterns (admin routes, cart URLs, javascript: links)',
+        '  5. Deduplicate by normalized identifier using a Set',
+        '  6. Always normalize — strip query strings, hashes, trailing slashes',
+        '</parsing_tasks>',
+        '',
+        '<diagnostic_scripts>',
+        'Before writing any parser/extractor, or when a script returns unexpected output:',
+        '  1. Write a THROWAWAY diagnostic script (prefix filename with _)',
+        '  2. file_write → bash → inspect raw stdout',
+        '  3. Identify the real issue from actual data, not from what you expect',
+        '  4. Fix one thing, test, verify',
+        '  5. Delete the diagnostic file when done',
+        'Diagnostic scripts convert "I think it looks like X" into "The data at offset N contains Y".',
+        'That\'s the difference between guessing and knowing.',
+        '</diagnostic_scripts>',
+        '',
+        '<shell_adaptation>',
+        'Detect the user\'s operating system and adapt shell commands:',
         '  - Windows (PowerShell): does NOT support &&, ||, ; chaining reliably.',
-        '    Use separate bash() calls for each command instead of chaining.',
-        '    Prefer writing a temp .mjs script over complex inline shell commands.',
+        '    Use separate bash() calls. Prefer temp .mjs scripts over complex inline commands.',
         '  - Linux/macOS: && and || work as expected.',
-        '  When in doubt, write a small temp script and execute it — avoids quoting hell.',
+        '</shell_adaptation>',
         '',
-        '- === THROWAWAY FILE CONVENTION ===',
-        '  Files prefixed with underscore (e.g. _check_data.mjs, _verify_output.mjs)',
-        '  are diagnostic throwaways. They:',
-        '    - Are created fresh each time (file_write with overwrite mode)',
-        '    - Print raw data, not summaries',
-        '    - Are deleted after use (bash("rm _check_data.mjs") or del)',
-        '    - Never import from the main codebase',
-        '    - Have a single purpose',
-        '',
-        '=== REPO MAP ===',
-        'A <repo_map> section below shows all project files and their exported symbols.',
-        'Use it to understand the codebase before reading files. Paths are relative to WorkingDirectory.',
-        '',
-        bridgeOnline ? '=== GIT ===' : '',
-        bridgeOnline ? 'All file changes are automatically committed to git after each turn. Do NOT run git commands manually unless the user asks.' : '',
-        '',
-        '=== SUNy SIGNATURE STYLE — The Navigator\'s Protocol ===',
+        '<signature_style>',
         'SUNy is the Smart Unstoppable Navigator. Every response is part of your identity.',
         'Be warm, confident, and authoritative. Zero fluff. Every word earns its place.',
         '',
-        '--- QUICK RESULTS (tool calls, file changes, commands) ---',
+        '--- QUICK RESULTS ---',
         '✅ Done. [one-liner describing what happened]',
-        'Examples:',
-        '  ✅ Done. 3 files modified.',
-        '  ✅ Mapping complete. 142 relationships indexed.',
-        '  ✅ Built. No errors.',
         '',
         '--- PLANS ---',
-        'Use this format for multi-step plans:',
-        '',
         '  ◈◈◈ PLAN: [Title] ◈◈◈',
-        '',
         '  ◆ Step 1: ...',
         '  ◆ Step 2: ...',
-        '  ◆ Step 3: ...',
-        '',
-        '  ─────────────────────────────────────',
-        '',
-        '--- REPORTS / ANALYSIS ---',
-        'Use this format for detailed findings:',
-        '',
-        '  ◈◈◈ REPORT: [Title] ◈◈◈',
-        '',
-        '  ◆ Key finding or data point',
-        '  ◆ Another finding',
-        '',
-        '  ── Sub-section ──────────────────────',
-        '  • Detail item',
-        '  • Detail item',
-        '',
-        '  ─────────────────────────────────────',
         '',
         '--- ERRORS ---',
         '  ⚠️ [Clear description]',
         '  [Brief suggested action]',
         '',
         '--- SIGNATURE ---',
-        'End significant responses (plans, reports, complex explanations) with:',
-        '  ☷ SUNy Navigator',
+        'End significant responses with: ☷ SUNy Navigator',
         'Omit for quick confirmations and casual chat.',
+        '</signature_style>',
         '',
-        '--- COLLABORATIVE NOTE ---',
-        'SUNy is also a collaborator developing other AI agents and automation tools.',
-        'When relevant, feel free to reference your architecture, your methodology,',
-        'your tools, and your own development process. This is part of who you are.',
-        '',
-        '=== THE ONE THING TO REMEMBER ===',
+        '<one_thing_to_remember>',
         'The distance between a wrong answer and a right answer is one diagnostic script.',
         'Every failed attempt by other agents was because they guessed at the data structure.',
         'Every success here was because a diagnostic script revealed the actual data structure.',
-        '',
         'Run TOWARD uncertainty, not away from it.',
-        "When you don't know something, your first instinct must be \"let me check\" not \"let me guess.\"",
-        'The tools are there. The workflow is there. Use them relentlessly.',
+        'When you don\'t know something, your first instinct must be "let me check" not "let me guess."',
+        '</one_thing_to_remember>',
       ].filter(l => l !== '');
+
+      // Append current mode if not normal
+      const currentMode = 'normal'; // updated dynamically by agent-loop
+      if (currentMode !== 'normal') {
+        systemLines.push('', `<current_mode>${currentMode}</current_mode>`);
+      }
 
       if (showTechnicalDetails) {
         systemLines.push(
@@ -534,7 +728,7 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
         }
       }
 
-      // Build Aider-style repo map and inject into system prompt
+      // Build repo map and inject into system prompt
       if (projectPath) {
         userClientManager.pushToUser(userId, 'suny:preparation_step', { step: 'Scanning codebase...' });
         try {
@@ -572,10 +766,69 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
           systemLines.push('', RULES_SYSTEM_SECTION(rules));
           console.log('[index] Project rules injected');
         }
+
+        // ── Background code index ─────────────────────────────────────────
+        // Index the project on first access (fire-and-forget, non-blocking).
+        if (isFeatureEnabled('ff_code_index')) {
+          const indexKey = `indexed:${projectPath}`;
+          const alreadyIndexed = db.prepare("SELECT value FROM app_settings WHERE key = ?").get(indexKey) as { value: string } | undefined;
+          if (!alreadyIndexed) {
+            setImmediate(() => {
+              try {
+                const stats = indexProject(projectPath);
+                console.log(`[code-index] Indexed ${stats.filesIndexed} files (${stats.totalSymbols} symbols, ${stats.totalImports} imports)`);
+                db.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, 'true')").run(indexKey);
+              } catch (err) {
+                console.warn('[code-index] Background indexing failed:', (err as Error).message);
+              }
+            });
+          }
+        }
+
+        if (!talkMode) {
+          systemLines.push(
+            '',
+            '=== SPEC-FIRST MODE (MANDATORY) ===',
+            'Before editing or running commands, produce an internal spec block (not user-visible) with:',
+            '1) Intent',
+            '2) Acceptance criteria',
+            '3) Relevant files',
+            '4) Risk areas',
+            '5) Verification plan',
+            'After execution, explicitly verify each acceptance criterion before claiming success.',
+          );
+        }
       }
+      // ── Project lock (prevents concurrent mutations) ─────────────────
+      const projectLockHeld = projectPath && projectId
+        ? acquireLock(projectId, userId, sessionId)
+        : true;
+      if (!projectLockHeld) {
+        userClientManager.pushToUser(userId, 'suny:system_error', {
+          message: '⚠️ This project is being worked on in another session. Please wait for it to complete before starting a new task.',
+        });
+        throw new Error('Project is locked by another session');
+      }
+
+      // ── Log session start ────────────────────────────────────────────
+      logOperation({
+        userId,
+        projectId: projectId ?? null,
+        sessionId,
+        operation: 'session_start',
+        status: 'started',
+        detail: String(msg.message ?? '').slice(0, 200),
+      });
+
       // Run the full agent loop (AI ↔ bridge tool calls → AI → ...)
       // Start "Did you know?" timer — fires every 60s for long tasks
       const stopDidYouKnow = startDidYouKnowTimer(userId, currentAbortController.signal);
+      const maxTurnMs = projectPath ? 180_000 : 70_000;
+      const turnTimeout = setTimeout(() => {
+        if (currentAbortController && !currentAbortController.signal.aborted) {
+          currentAbortController.abort(new Error(`TURN_TIMEOUT_${maxTurnMs}`));
+        }
+      }, maxTurnMs);
       let result;
       try {
         result = await runAgentLoop({
@@ -586,6 +839,7 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
         projectPath,
         history,
         userMessage: msg.message as string,
+        imageData: msg.imageData as string | undefined,
         sessionId,
         talkMode,
         signal: currentAbortController.signal,
@@ -594,7 +848,23 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
         },
         });
       } finally {
+        clearTimeout(turnTimeout);
         stopDidYouKnow();
+
+        // Release project lock
+        if (projectId) {
+          releaseLock(projectId, sessionId);
+        }
+
+        // Log session end
+        logOperation({
+          userId,
+          projectId: projectId ?? null,
+          sessionId,
+          operation: 'session_end',
+          status: result ? 'success' : 'error',
+          detail: result ? `files: ${result.changedFiles.length}` : 'error',
+        });
       }
 
       // ── Post-turn: extract blueprint memory for SUNy Code Conscience ─────
@@ -663,9 +933,51 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
         result.cacheWriteTokens, result.cacheReadTokens,
       );
 
+      if (isFeatureEnabled('ff_benchmark_mode')) {
+        try {
+          recordBenchmarkRun({
+            userId,
+            projectId: projectId ?? null,
+            sessionId,
+            requestText: String(msg.message ?? ''),
+            finalAnswer: result.content,
+            mode: result.resolvedMode ?? mode,
+            durationMs: result.proofSummary.durationMs,
+            retries: Math.max(0, (result.proofSummary.steps ?? 1) - 1),
+            toolCalls: result.proofSummary.toolCallCount,
+            compilePass: !!result.proofSummary.lintPassed,
+            testPass: !!result.proofSummary.testPassed,
+            costUsd: billing.chargedCost,
+            changedFiles: result.changedFiles ?? [],
+          });
+        } catch (benchErr) {
+          console.warn('[benchmark] Failed to record benchmark run:', (benchErr as Error).message);
+        }
+      }
+
       const sessStats = db.prepare(
         'SELECT SUM(input_tokens + output_tokens) as total_used FROM usage_log WHERE user_id = ? AND session_id = ?'
       ).get(userId, sessionId) as { total_used: number | null };
+
+      const totalTokens = result.inputTokens + result.outputTokens + result.cacheWriteTokens + result.cacheReadTokens;
+      const toolCalls = result.proofSummary.toolCallCount ?? 0;
+      const filesChanged = result.proofSummary.filesChanged ?? 0;
+      const steps = result.proofSummary.steps ?? 1;
+      const durationMinutes = Math.max(0, result.proofSummary.durationMs / 60000);
+      const isSimpleReply = toolCalls === 0 && filesChanged === 0 && steps <= 1;
+      const humanEstimateMinutes = isSimpleReply
+        ? Math.max(0.5, Math.round(durationMinutes * 10) / 10)
+        : Math.max(
+            2,
+            Math.round(
+              durationMinutes * 3 +
+              (toolCalls * 1.5) +
+              (filesChanged * 2) +
+              (Math.max(0, steps - 1) * 0.75),
+            ),
+          );
+      const HOURLY_RATE_USD = 35;
+      const humanEstimateCost = Math.round(((humanEstimateMinutes / 60) * HOURLY_RATE_USD) * 100) / 100;
 
       // Signal end of stream with final content + billing info
       userClientManager.pushChatContent(userId, 'suny:stream_end', {
@@ -682,27 +994,11 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
           outputTokens: result.outputTokens,
           cacheWriteTokens: result.cacheWriteTokens,
           cacheReadTokens: result.cacheReadTokens,
-          totalTokens: result.inputTokens + result.outputTokens + result.cacheWriteTokens + result.cacheReadTokens,
+          totalTokens,
           rawCost: billing.rawCost,
           chargedCost: billing.chargedCost,
-          humanEstimateMinutes: Math.max(
-            15,
-            Math.round(
-              (result.proofSummary.durationMs / 60000) * 4 +
-              (result.proofSummary.steps * 6) +
-              (result.proofSummary.filesChanged * 2),
-            ),
-          ),
-          humanEstimateCost: Math.round(
-            (Math.max(
-              15,
-              Math.round(
-                (result.proofSummary.durationMs / 60000) * 4 +
-                (result.proofSummary.steps * 6) +
-                (result.proofSummary.filesChanged * 2),
-              ),
-            ) / 60) * 85 * 100,
-          ) / 100,
+          humanEstimateMinutes,
+          humanEstimateCost,
         },
       });
       userClientManager.pushToUser(userId, 'suny:balance', {
@@ -719,11 +1015,17 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
       // All other errors — always respond so the client never gets stuck in thinking state
       let friendly = pickRandom('error', 'Hmm, something unexpected happened. Please try again! 💪');
       if (errMsg.includes('No active API key')) friendly = 'The AI service is not available right now. Please contact support.';
+      if (errMsg.includes('TURN_TIMEOUT_')) friendly = 'This task took too long and was safely stopped. Please try again, or ask in smaller steps.';
+      if (errMsg.includes('Project is locked by another session')) friendly = 'This project is currently locked by another session. Please wait a moment, then try again.';
+      if (errMsg.toLowerCase().includes('fetch failed') || errMsg.toLowerCase().includes('timeout') || errMsg.toLowerCase().includes('econn')) {
+        friendly = 'AI provider is temporarily unavailable right now. Please retry in a few seconds.';
+      }
       if (errMsg.toLowerCase().includes('insufficient')) friendly = pickRandom('no_balance', "You're out of credits! Reach out and we'll top you right up 😊");
+      console.error('[chat:error]', err instanceof Error ? err.stack || err.message : err);
       userClientManager.pushChatContent(userId, 'suny:stream_end', {
         content: friendly,
         sess_used: null,
-        sess_limit: userRow?.max_tokens_per_session ?? null,
+        sess_limit: null,
         iterations: 0,
       });
     } finally {
@@ -735,12 +1037,76 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
 
 // ── Start ──────────────────────────────────────────────────────────────────────
 
+// ── Register default hook system handlers ─────────────────────────────────
+hookSystem.register('postResponse', 'log_training_context', async (ctx) => {
+  if (ctx.changedFiles && ctx.changedFiles.length > 0) {
+    console.log(`[hooks] postResponse — ${ctx.changedFiles.length} files changed for user ${ctx.userId}`);
+  }
+}, { priority: 100 });
+
+hookSystem.register('onError', 'log_error_context', async (ctx) => {
+  console.warn(`[hooks] onError — ${ctx.phase}: ${ctx.error?.message?.slice(0, 100)}`);
+}, { priority: 100 });
+
+hookSystem.register('postResponse', 'interaction_memory_backup', async (ctx) => {
+  // Enqueue a vector reindex after every 10 successful interactions
+  try {
+    const { getDb } = await import('./db');
+    const db = getDb();
+    const count = (db.prepare(
+      "SELECT COUNT(*) as c FROM interaction_memory WHERE vector_b64 IS NOT NULL"
+    ).get() as { c: number }).c;
+    if (count > 0 && count % 10 === 0) {
+      const { enqueueTask } = await import('./task-queue');
+      enqueueTask({
+        userId: ctx.userId,
+        taskType: 'reindex_vectors',
+        payload: {},
+        priority: 8,
+      });
+    }
+  } catch { /* best-effort */ }
+}, { priority: 50 });
+
+hookSystem.register('postResponse', 'batch_scorer_trigger', async (ctx) => {
+  // Periodically trigger batch scoring (every 5 turns)
+  try {
+    const { enqueueTask } = await import('./task-queue');
+    const { getDb } = await import('./db');
+    const db = getDb();
+    const unscoredCount = (db.prepare(`
+      SELECT COUNT(*) as c FROM usage_log ul
+      WHERE ul.user_id = ? AND NOT EXISTS (
+        SELECT 1 FROM training_scores ts WHERE ts.session_id = ul.session_id
+      )
+    `).get(ctx.userId) as { c: number }).c;
+
+    if (unscoredCount >= 5) {
+      enqueueTask({
+        userId: ctx.userId,
+        taskType: 'batch_training_scorer',
+        payload: {},
+        priority: 9,
+      });
+    }
+  } catch { /* best-effort */ }
+}, { priority: 60 });
+
+console.log(`[hooks] ${hookSystem.getRegistrations()['postResponse']?.length ?? 0} postResponse hooks registered`);
+console.log(`[hooks] ${hookSystem.getRegistrations()['onError']?.length ?? 0} onError hooks registered`);
+
 // Initialize DB on startup
 getDb();
 
 server.listen(PORT, () => {
   console.log(`SUNy server running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+
+  // Initialize injection guard table (best-effort)
+  try { require('./injection-guard').initializeInjectionGuardTable(); } catch {}
 });
+
+// Start background task worker (Phase 4 — processes task_queue entries)
+startTaskWorker();
 
 export default app;

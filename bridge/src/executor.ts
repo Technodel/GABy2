@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { execFile } from 'child_process';
 import { validatePath, validateCommand, SandboxError } from './sandbox';
 import { processManager } from './process-manager';
 
@@ -35,6 +36,9 @@ export async function handleExec(
         break;
       case 'exec:path_exists':
         await execPathExists(id, payload, send);
+        break;
+      case 'exec:pick_folder':
+        await execPickFolder(id, send);
         break;
       case 'exec:shell':
         await execShell(id, payload, send);
@@ -112,10 +116,68 @@ async function execPathExists(id: string, payload: Record<string, unknown>, send
   send({ type: 'bridge:done', id, payload: { exists: fs.existsSync(targetPath), exitCode: 0, success: true } });
 }
 
+function runExecFile(file: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { windowsHide: true }, (err, stdout) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve(String(stdout || '').trim());
+    });
+  });
+}
+
+async function pickFolderPath(): Promise<string | null> {
+  if (process.platform === 'win32') {
+    const script = [
+      'Add-Type -AssemblyName System.Windows.Forms',
+      '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog',
+      "$dialog.Description = 'Choose a folder for your project'",
+      '$dialog.ShowNewFolderButton = $true',
+      'if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }',
+    ].join('; ');
+    const picked = await runExecFile('powershell.exe', ['-NoProfile', '-STA', '-Command', script]);
+    return picked || null;
+  }
+
+  if (process.platform === 'darwin') {
+    const script = 'POSIX path of (choose folder with prompt "Choose a folder for your project")';
+    const picked = await runExecFile('osascript', ['-e', script]);
+    return picked || null;
+  }
+
+  const linuxPickers: Array<{ cmd: string; args: string[] }> = [
+    { cmd: 'zenity', args: ['--file-selection', '--directory', '--title=Choose a folder for your project'] },
+    { cmd: 'kdialog', args: ['--getexistingdirectory', '--title', 'Choose a folder for your project'] },
+  ];
+
+  for (const picker of linuxPickers) {
+    try {
+      const picked = await runExecFile(picker.cmd, picker.args);
+      if (picked) return picked;
+    } catch {
+      // Try next picker.
+    }
+  }
+
+  return null;
+}
+
+async function execPickFolder(id: string, send: SendFn): Promise<void> {
+  const picked = await pickFolderPath();
+  if (!picked) {
+    send({ type: 'bridge:error', id, payload: { message: 'No folder selected' } });
+    return;
+  }
+  send({ type: 'bridge:done', id, payload: { path: picked, exitCode: 0, success: true } });
+}
+
 async function execShell(id: string, payload: Record<string, unknown>, send: SendFn): Promise<void> {
   const cwd = payload.cwd as string;
   const command = payload.command as string;
   const requiresConfirmation = payload.requiresConfirmation as boolean | undefined;
+  const timeoutMs = (payload.timeout as number) || 120_000;  // default 2 min local fallback
 
   validatePath(cwd);
   validateCommand(command, requiresConfirmation);
@@ -135,6 +197,15 @@ async function execShell(id: string, payload: Record<string, unknown>, send: Sen
     (line, stream) => send({ type: 'bridge:stream', id, payload: { line, stream } }),
     (exitCode) => send({ type: 'bridge:done', id, payload: { exitCode, success: exitCode === 0 } })
   );
+
+  // Local timeout: if the server-side timeout fails to reach us (e.g. reconnect),
+  // kill the process locally so it doesn't hang forever.
+  setTimeout(() => {
+    if (processManager.isRunning(id)) {
+      processManager.kill(id);
+      send({ type: 'bridge:error', id, payload: { message: `Command timed out after ${timeoutMs / 1000}s` } });
+    }
+  }, timeoutMs);
 }
 
 async function execStartDevServer(id: string, payload: Record<string, unknown>, send: SendFn): Promise<void> {

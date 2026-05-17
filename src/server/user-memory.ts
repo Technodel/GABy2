@@ -1,0 +1,133 @@
+/**
+ * SUNy User Memory Tool — persistent fact storage via SQLite.
+ *
+ * The AI can save and recall user-specific facts (preferences, project context,
+ * decisions) across sessions using the existing user_memories table.
+ *
+ * Two tools:
+ *   save_memory  – save a fact
+ *   recall_memories – retrieve all saved facts
+ */
+
+import { tool } from 'ai';
+import { z } from 'zod';
+import { getDb } from './db';
+
+// -- Tool factory -------------------------------------------------------------
+
+export interface MemoryToolContext {
+  userId: number;
+  projectPath?: string;
+}
+
+export function createMemoryTools(ctx: MemoryToolContext) {
+  const { userId, projectPath } = ctx;
+  const db = getDb();
+
+  // Determine project_id if we have a project path
+  let projectId: number | null = null;
+  if (projectPath) {
+    const row = db
+      .prepare('SELECT id FROM projects WHERE user_id = ? AND local_path = ?')
+      .get(userId, projectPath) as { id: number } | undefined;
+    if (row) projectId = row.id;
+  }
+
+  const saveMemoryTool = tool({
+    description:
+      'Save a fact or piece of information to long-term memory. Use this when the user tells you something they want you to remember (preferences, important context, decisions, personal details). The fact will persist across conversations.',
+    parameters: z.object({
+      fact: z
+        .string()
+        .min(1)
+        .max(2000)
+        .describe(
+          'The fact or information to remember. Should be a clear, self-contained statement (e.g., "User prefers tabs over spaces").',
+        ),
+      category: z
+        .string()
+        .max(100)
+        .optional()
+        .default('general')
+        .describe(
+          'Optional category: "general", "preference", "decision", "project_context", "personal".',
+        ),
+    }),
+    execute: async ({ fact, category }) => {
+      const tagged = category !== 'general' ? `[${category}] ${fact}` : fact;
+
+      db.prepare(
+        'INSERT INTO user_memories (user_id, project_id, content) VALUES (?, ?, ?)',
+      ).run(userId, projectId, tagged);
+
+      return `✅ Saved: "${fact}"`;
+    },
+  });
+
+  const recallMemoriesTool = tool({
+    description:
+      'Recall saved facts from memory. Returns all stored facts for this user/project. Use this at the start of a conversation or when you need to remember user preferences.',
+    parameters: z.object({
+      category: z
+        .string()
+        .max(100)
+        .optional()
+        .describe(
+          'Optional category filter: "general", "preference", "decision", "project_context", "personal". Returns all if omitted.',
+        ),
+    }),
+    execute: async ({ category }) => {
+      let rows: Array<{ id: number; content: string; created_at: string }>;
+
+      if (projectId) {
+        rows = db
+          .prepare(
+            'SELECT id, content, created_at FROM user_memories WHERE user_id = ? AND (project_id = ? OR project_id IS NULL) ORDER BY created_at DESC',
+          )
+          .all(userId, projectId) as typeof rows;
+      } else {
+        rows = db
+          .prepare(
+            'SELECT id, content, created_at FROM user_memories WHERE user_id = ? ORDER BY created_at DESC',
+          )
+          .all(userId) as typeof rows;
+      }
+
+      if (category) {
+        rows = rows.filter((r) =>
+          r.content.startsWith(`[${category}]`),
+        );
+      }
+
+      if (rows.length === 0) {
+        return 'No saved memories found.' + (category ? ` (filtered by category: ${category})` : '');
+      }
+
+      const lines = rows.map(
+        (r, i) => `${i + 1}. ${r.content.replace(/^\[.*?\]\s*/, '')}`,
+      );
+      return `📋 Saved memories (${rows.length}):\n${lines.join('\n')}`;
+    },
+  });
+
+  const deleteMemoryTool = tool({
+    description:
+      'Delete a specific memory by its ID number. Use recall_memories first to find the ID.',
+    parameters: z.object({
+      id: z.number().int().positive().describe('The ID of the memory to delete.'),
+    }),
+    execute: async ({ id }) => {
+      const result = db
+        .prepare('DELETE FROM user_memories WHERE id = ? AND user_id = ?')
+        .run(id, userId);
+      if (result.changes > 0) return `✅ Deleted memory #${id}.`;
+      return `⚠️ Memory #${id} not found.`;
+    },
+  });
+
+  return {
+    save_memory: saveMemoryTool,
+    recall_memories: recallMemoriesTool,
+    delete_memory: deleteMemoryTool,
+  };
+}

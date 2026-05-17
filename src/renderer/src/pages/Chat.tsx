@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Plus, Trash2, Settings, LogOut, Square, Eraser, Book, Edit3, RotateCcw, Copy, Check, Pencil, MessageSquare, FileText, X, BarChart2, User, HelpCircle, Folder, FolderOpen, Play, ChevronRight, ChevronDown, Sparkles, Home, Phone } from 'lucide-react';
+import { Send, Plus, Trash2, Settings, LogOut, Square, Eraser, Book, Edit3, RotateCcw, Copy, Check, Pencil, MessageSquare, FileText, X, BarChart2, User, HelpCircle, Folder, FolderOpen, Play, ChevronRight, ChevronDown, Sparkles, Home, Phone, Download } from 'lucide-react';
 import BalanceBadge from '../components/BalanceBadge';
 import BridgeStatusBadge from '../components/BridgeStatusBadge';
 import ModeSelector from '../components/ModeSelector';
@@ -11,7 +11,9 @@ import { useNavigate } from 'react-router-dom';
 // ── Bridge install instructions ────────────────────────────────────────────────
 function BridgeInstallInstructions({ autoCopy = false }: { autoCopy?: boolean }) {
   const [cmd, setCmd] = useState('');
+  const [winInstallerCmd, setWinInstallerCmd] = useState('');
   const [copied, setCopied] = useState(false);
+  const [installerDownloaded, setInstallerDownloaded] = useState(false);
   const isWindows = navigator.userAgent.includes('Windows');
 
   useEffect(() => {
@@ -22,8 +24,12 @@ function BridgeInstallInstructions({ autoCopy = false }: { autoCopy?: boolean })
         const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
         const serverUrl = import.meta.env.DEV ? 'ws://localhost:3500' : `${wsProto}://${window.location.host}`;
         const tgzUrl = `${window.location.protocol}//${window.location.host}/bridge/suny-bridge.tgz`;
-        const c = `npm install -g ${tgzUrl} && suny-bridge start --token ${data.token} --server ${serverUrl}`;
+        // Use 'npx suny-bridge' which works immediately after npm install, instead of relying on PATH updates
+        const c = `npm install -g ${tgzUrl} && npx suny-bridge start --token ${data.token} --server ${serverUrl}`;
+        const exeUrl = `${window.location.protocol}//${window.location.host}/bridge/suny-bridge.exe`;
+        const winCmd = `@echo off\r\ntitle SUNy Bridge Setup\r\ncolor 0A\r\nset BRIDGE_DIR=%APPDATA%\\suny-bridge\r\nif not exist "%BRIDGE_DIR%" mkdir "%BRIDGE_DIR%"\r\nif not exist "%BRIDGE_DIR%\\suny-bridge.exe" (\r\n  echo Downloading SUNy Bridge... (may take 30-60 seconds)\r\n  powershell -Command "Invoke-WebRequest -Uri '${exeUrl}' -OutFile '%APPDATA%\\\\suny-bridge\\\\suny-bridge.exe' -UseBasicParsing"\r\n  if errorlevel 1 (\r\n    echo.\r\n    echo Download failed. Check your internet connection.\r\n    pause\r\n    exit /b 1\r\n  )\r\n  echo Download complete.\r\n)\r\necho.\r\necho Starting SUNy Bridge...\r\n"%BRIDGE_DIR%\\suny-bridge.exe" --token ${data.token} --server ${serverUrl}\r\n`;
         setCmd(c);
+        setWinInstallerCmd(winCmd);
         // Auto-copy as soon as command is ready
         if (autoCopy) {
           navigator.clipboard.writeText(c).then(() => { setCopied(true); setTimeout(() => setCopied(false), 3000); }).catch(() => {});
@@ -34,6 +40,21 @@ function BridgeInstallInstructions({ autoCopy = false }: { autoCopy?: boolean })
   function copy() {
     if (!cmd) return;
     navigator.clipboard.writeText(cmd).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000); });
+  }
+
+  function downloadWindowsInstaller() {
+    if (!isWindows || !winInstallerCmd) return;
+    const blob = new Blob([winInstallerCmd], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'install-suny-bridge.cmd';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    setInstallerDownloaded(true);
+    setTimeout(() => setInstallerDownloaded(false), 5000);
   }
 
   return (
@@ -71,6 +92,24 @@ function BridgeInstallInstructions({ autoCopy = false }: { autoCopy?: boolean })
           </button>
         )}
       </div>
+
+      {isWindows && (
+        <div style={{ marginTop: 8 }}>
+          <button
+            className="btn btn-secondary"
+            onClick={downloadWindowsInstaller}
+            disabled={!winInstallerCmd}
+            style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}
+            title="Download one-click installer"
+          >
+            <Download size={14} />
+            {installerDownloaded ? 'Installer downloaded!' : 'Download one-click installer (.cmd)'}
+          </button>
+          <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6 }}>
+            No Node.js required. Double-click the file � it downloads the bridge and connects automatically.
+          </p>
+        </div>
+      )}
 
       {autoCopy && cmd && (
         <p style={{ fontSize: 11, color: copied ? 'var(--success)' : 'var(--text-muted)', marginTop: 6, transition: 'color 0.3s' }}>
@@ -485,6 +524,23 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
   // ── End Blueprint Memory Graph ──────────────────────────────────────────
   const thinkingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastResponseEvent = useRef(Date.now());
+  const requestStartedAtRef = useRef<number | null>(null);
+  const statusBagRef = useRef<Record<string, string[]>>({});
+  const lastStatusRef = useRef<Record<string, string>>({});
+
+  function pickStatusVariant(group: string, list: string[], fallback: string): string {
+    if (!list.length) return fallback;
+    const bag = statusBagRef.current[group] ?? [];
+    if (bag.length === 0) {
+      statusBagRef.current[group] = [...list].sort(() => Math.random() - 0.5);
+    }
+    let next = statusBagRef.current[group].pop() ?? fallback;
+    if (next === lastStatusRef.current[group] && list.length > 1) {
+      next = statusBagRef.current[group].pop() ?? list.find(v => v !== lastStatusRef.current[group]) ?? fallback;
+    }
+    lastStatusRef.current[group] = next;
+    return next;
+  }
 
   function clearThinkingTimeout() {
     if (thinkingTimeoutRef.current) {
@@ -496,11 +552,28 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
   function resetThinkingTimeout() {
     clearThinkingTimeout();
     lastResponseEvent.current = Date.now();
+    if (!requestStartedAtRef.current) requestStartedAtRef.current = Date.now();
     thinkingTimeoutRef.current = setTimeout(() => {
       // No response for 90s — cancel and notify
       setThinking(false);
       setStreamingContent('');
-      addMessage('system', "SUNy seems to be taking longer than expected. Try sending your message again — I'll take it from here! 💪");
+      const durationMs = requestStartedAtRef.current ? Math.max(0, Date.now() - requestStartedAtRef.current) : 90_000;
+      addMessage('suny', "SUNy seems to be taking longer than expected. The request timed out safely. Please try again.", {
+        timestamp: Date.now(),
+        report: {
+          durationMs,
+          totalTokens: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheWriteTokens: 0,
+          cacheReadTokens: 0,
+          chargedCost: 0,
+          humanEstimateMinutes: 0.5,
+          humanEstimateCost: 0.29,
+          messageCount: 1,
+        },
+      });
+      requestStartedAtRef.current = null;
     }, 90000);
   }
   const [balance, setBalance] = useState(0);
@@ -572,8 +645,6 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
   // ── Bridge keyboard shortcut help ────────────────────────────────────────────
   const [showHelp, setShowHelp] = useState(false);
 
-  const [terminalLaunching, setTerminalLaunching] = useState(false);
-  const [terminalLaunched, setTerminalLaunched] = useState(false);
   const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({
     projects: true,
     memories: true,
@@ -582,23 +653,30 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
   });
   const [confirmClearMemories, setConfirmClearMemories] = useState(false);
 
-  async function launchBridgeTerminal() {
-    setTerminalLaunching(true);
-    setTerminalLaunched(false);
-    try {
-      const res = await fetch('/api/bridge/launch-terminal', { method: 'POST', credentials: 'include' });
-      if (res.ok) {
-        setTerminalLaunched(true);
-        setTimeout(() => setTerminalLaunched(false), 4000);
-      } else {
-        // Remote server or no terminal — fall back to copy instructions already visible
-      }
-    } catch {
-      // ignore, copy instructions still visible
-    } finally {
-      setTerminalLaunching(false);
-    }
+  function stopCurrentResponse() {
+    if (!thinking) return;
+    wsSend({ type: 'chat:cancel', requestId: '' });
   }
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && thinking) {
+        e.preventDefault();
+        stopCurrentResponse();
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l') {
+        e.preventDefault();
+        if (!thinking) clearChat();
+        return;
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [thinking, clearChat, sendMessage]);
+
   const lastNarrationRef = useRef('');
   const msgEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -1053,7 +1131,18 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
         if (!activeProofIdRef.current) startProofRun();
         resetThinkingTimeout();
       } else if (msg.event === 'suny:preparation_step') {
-        setThinkingStatus(msg.step as string);
+        setThinkingStatus(pickStatusVariant('prep', [
+          'Getting everything ready…',
+          'Setting up the best approach…',
+          'Preparing your answer now…',
+          'Organizing the next steps…',
+          'Lining up what needs to happen…',
+          'Getting this ready for you…',
+          'Starting with the essentials…',
+          'Putting the plan in motion…',
+          'Collecting what I need first…',
+          'Preparing a clean run…',
+        ], 'Preparing your answer…'));
       } else if (msg.event === 'suny:done') {
         clearThinkingTimeout();
         setThinking(false);
@@ -1068,6 +1157,7 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
         setThinking(true);
         setThinkingStatus('');
         setStreamingContent('');
+        requestStartedAtRef.current = Date.now();
         if (!activeProofIdRef.current) startProofRun();
         resetThinkingTimeout();
       } else if (msg.event === 'suny:stream_chunk') {
@@ -1081,6 +1171,8 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
         clearThinkingTimeout();
         setThinking(false);
         setThinkingStatus('');
+        const requestDurationMs = requestStartedAtRef.current ? Math.max(0, Date.now() - requestStartedAtRef.current) : 0;
+        requestStartedAtRef.current = null;
         if (msg.routing_reason && typeof msg.routing_reason === 'string') {
           setRoutingReason(msg.routing_reason);
         }
@@ -1111,10 +1203,35 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
               humanEstimateCost: typeof rawReport.humanEstimateCost === 'number' ? rawReport.humanEstimateCost as number : 0,
               messageCount: 1,
             } satisfies ReportMetrics
-            : undefined;
+            : {
+              durationMs: requestDurationMs,
+              totalTokens: 0,
+              inputTokens: 0,
+              outputTokens: 0,
+              cacheWriteTokens: 0,
+              cacheReadTokens: 0,
+              chargedCost: 0,
+              humanEstimateMinutes: 0.5,
+              humanEstimateCost: 0.29,
+              messageCount: 1,
+            };
           addMessage('suny', finalContent, { timestamp: Date.now(), report });
         } else {
-          addMessage('system', "I finished processing but didn't receive a final reply text. Please send that again and I'll answer right away.");
+          addMessage('suny', "I finished processing but didn't receive a final reply text. Please send that again and I'll answer right away.", {
+            timestamp: Date.now(),
+            report: {
+              durationMs: requestDurationMs,
+              totalTokens: 0,
+              inputTokens: 0,
+              outputTokens: 0,
+              cacheWriteTokens: 0,
+              cacheReadTokens: 0,
+              chargedCost: 0,
+              humanEstimateMinutes: 0.5,
+              humanEstimateCost: 0.29,
+              messageCount: 1,
+            },
+          });
         }
         lastNarrationRef.current = '';
         setStreamingContent('');
@@ -1129,13 +1246,34 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
         loadProjectSpend();
       } else if (msg.event === 'suny:lint_running') {
         pushCheckToProof('Lint check started');
-        setThinkingStatus('Checking for errors...');
+        setThinkingStatus(pickStatusVariant('lint_running', [
+          'Doing a quick quality check…',
+          'Scanning for small issues…',
+          'Checking for fixable problems…',
+          'Running a code quality pass…',
+          'Looking for anything to clean up…',
+          'Reviewing for warnings and errors…',
+          'Making sure everything is neat…',
+        ], 'Checking for issues…'));
       } else if (msg.event === 'suny:lint_errors') {
         pushCheckToProof(`Lint found ${msg.errorCount as number} error(s) on pass ${msg.attempt as number}`);
-        setThinkingStatus(`Found ${msg.errorCount as number} error(s) — fixing (pass ${msg.attempt as number})...`);
+        const lintErrorStatus = pickStatusVariant('lint_errors', [
+          'I found {count} issue(s). Fixing them now (round {attempt})…',
+          '{count} issue(s) spotted. Cleaning this up (round {attempt})…',
+          'Found {count} thing(s) to fix. Working on it (round {attempt})…',
+          'A few issues showed up ({count}). Repairing now (round {attempt})…',
+        ], 'I found {count} issue(s). Fixing now (round {attempt})…');
+        setThinkingStatus(lintErrorStatus
+          .replace('{count}', String(msg.errorCount as number))
+          .replace('{attempt}', String(msg.attempt as number)));
       } else if (msg.event === 'suny:lint_passed') {
         pushCheckToProof('Lint passed');
-        setThinkingStatus('All checks passed ✓');
+        setThinkingStatus(pickStatusVariant('lint_passed', [
+          'Great news — quality checks passed ✓',
+          'Looks clean now ✓',
+          'All quality checks are clear ✓',
+          'Nice — no remaining quality issues ✓',
+        ], 'Quality checks passed ✓'));
         playSound('success');
       } else if (msg.event === 'suny:test_running') {
         pushCheckToProof(
@@ -1143,17 +1281,43 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
             ? 'Tests started'
             : `Tests re-run attempt ${(msg.attempt as number) + 1}`,
         );
-        setThinkingStatus(
-          (msg.attempt as number) === 0
-            ? 'Running tests...'
-            : `Re-running tests (attempt ${(msg.attempt as number) + 1})...`,
-        );
+        setThinkingStatus((msg.attempt as number) === 0
+          ? pickStatusVariant('test_running', [
+              'Running checks to confirm everything works…',
+              'Testing the latest changes…',
+              'Validating behavior now…',
+              'Checking that everything still works…',
+              'Running reliability checks…',
+            ], 'Running checks…')
+          : pickStatusVariant('test_rerun', [
+              `Trying the checks again (round ${(msg.attempt as number) + 1})…`,
+              `Re-checking after fixes (round ${(msg.attempt as number) + 1})…`,
+              `Running another validation pass (round ${(msg.attempt as number) + 1})…`,
+            ], `Running checks again (round ${(msg.attempt as number) + 1})…`));
       } else if (msg.event === 'suny:test_errors') {
         pushCheckToProof(`Tests found ${msg.failCount as number} failure(s) on attempt ${msg.attempt as number}`);
-        setThinkingStatus(`${msg.failCount as number} test(s) failing — fixing (attempt ${msg.attempt as number})...`);
+        const testErrorStatus = pickStatusVariant('test_errors', [
+          '{count} check(s) failed. Fixing now (round {attempt})…',
+          'I found {count} failing check(s). Repairing them (round {attempt})…',
+          '{count} issue(s) remain in validation. Working through them (round {attempt})…',
+        ], '{count} check(s) failed. Fixing now (round {attempt})…');
+        setThinkingStatus(testErrorStatus
+          .replace('{count}', String(msg.failCount as number))
+          .replace('{attempt}', String(msg.attempt as number)));
       } else if (msg.event === 'suny:test_passed') {
         pushCheckToProof('Tests passed');
-        setThinkingStatus((msg.attempt as number) === 0 ? 'Tests passed ✓' : `All tests passing ✓ (fixed in ${msg.attempt as number} attempt(s))`);
+        setThinkingStatus((msg.attempt as number) === 0
+          ? pickStatusVariant('test_passed', [
+              'Everything checked out ✓',
+              'All validations passed ✓',
+              'Looks good — checks are green ✓',
+              'Done — all checks passed ✓',
+            ], 'All checks passed ✓')
+          : pickStatusVariant('test_passed_retry', [
+              `All checks are passing now ✓ (fixed in ${msg.attempt as number} round(s))`,
+              `Great, it passes after ${msg.attempt as number} fix round(s) ✓`,
+              `Resolved and verified ✓ (${msg.attempt as number} correction round(s))`,
+            ], `All checks are passing now ✓ (${msg.attempt as number} rounds)`));
       } else if (msg.event === 'suny:test_gave_up') {
         pushCheckToProof('Tests still failing after retries');
         finishActiveProof('failed');
@@ -1340,6 +1504,7 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
     inputHistoryIndex.current = -1;
     addMessage('user', cleaned);
     setThinking(true);
+    requestStartedAtRef.current = Date.now();
     playSound('send');
     setTimeout(() => {
       inputRef.current?.focus();
@@ -1409,18 +1574,28 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
 
   async function pickFolderPath(onPicked: (path: string) => void) {
     try {
+      const promptForPath = () => {
+        const typed = window.prompt('Enter the full folder path for this project:', newProjectPath.trim() || '');
+        const cleaned = typed?.trim() || '';
+        if (!cleaned) return;
+        onPicked(cleaned);
+        setNewProjectPathError('');
+      };
+
       const res = await fetch('/api/pick-folder', { method: 'POST', credentials: 'include' });
       if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        setNewProjectPathError(data?.error || 'Folder picker is unavailable here. Please type the full folder path.');
+        promptForPath();
         return;
       }
       const data = await res.json() as { path?: string };
-      if (!data.path) return;
+      if (!data.path) {
+        promptForPath();
+        return;
+      }
       onPicked(data.path);
       setNewProjectPathError('');
     } catch {
-      setNewProjectPathError('Unable to open folder picker. Please type the full folder path.');
+      promptForPath();
     }
   }
 
@@ -2564,24 +2739,9 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
 
                 <BridgeInstallInstructions autoCopy />
 
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 16, gap: 8 }}>
-                  <button
-                    className="btn btn-primary"
-                    style={{ display: 'flex', alignItems: 'center', gap: 7, flex: 1, justifyContent: 'center', background: terminalLaunched ? 'var(--success)' : undefined }}
-                    onClick={launchBridgeTerminal}
-                    disabled={terminalLaunching}
-                    title="Opens a PowerShell window — just press Enter inside it"
-                  >
-                    <span style={{ fontSize: 15 }}>{terminalLaunched ? '✓' : terminalLaunching ? '…' : '⚡'}</span>
-                    {terminalLaunched ? 'Terminal opened!' : terminalLaunching ? 'Opening...' : 'Open Terminal & Run'}
-                  </button>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
                   <button className="btn btn-secondary" onClick={() => setShowBridgeTip(false)}>Close</button>
                 </div>
-                {terminalLaunched && (
-                  <p style={{ fontSize: 12, color: 'var(--success)', marginTop: 8, textAlign: 'center', fontWeight: 500 }}>
-                    ✓ A PowerShell window just opened — press Enter inside it to install.
-                  </p>
-                )}
               </>
             )}
           </div>
@@ -3090,14 +3250,21 @@ export default function Chat({ onLogout, onOpenSettings, onBridgeOffline }: Chat
                 <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px', color: 'var(--text-muted)', marginBottom: 8 }}>Features</div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                   {[
-                    { icon: '💬', title: 'Talk / Write mode', desc: 'Toggle between conversational chat (Talk) and file-focused code editing (Write).' },
-                    { icon: '📋', title: 'Project Rules', desc: 'Set persistent instructions SUNy follows in every chat for a project (e.g. "always use TypeScript strict mode").' },
-                    { icon: '🧠', title: 'Memories', desc: 'SUNy remembers key facts about your project automatically.' },
-                    { icon: '🎭', title: 'Persona', desc: 'Give SUNy a custom role for a project — e.g. "You are a security expert".' },
-                    { icon: '🔖', title: 'Checkpoints', desc: 'Save a snapshot of your chat and restore it at any time.' },
-                    { icon: '⚡', title: 'AUTO mode', desc: 'SUNy runs tests and lint in a loop until errors are resolved.' },
-                    { icon: '📁', title: '@file: mentions', desc: 'Type @file:path/to/file.ts in any message to reference a file directly.' },
-                    { icon: '🖥️', title: 'Dev Server', desc: 'Start your project\'s dev server from the sidebar and get a clickable URL.' },
+                    { icon: '🎯', title: 'One-Click Ship', desc: 'Give one goal — SUNy plans, edits, tests, fixes, and delivers a verified result.' },
+                    { icon: '📋', title: 'Proof Panel', desc: 'Every task shows exactly what changed, what passed, and what was fixed.' },
+                    { icon: '⏪', title: 'One-Click Undo', desc: 'Every edit creates a restore point. Roll back any change instantly.' },
+                    { icon: '🧠', title: 'Code Conscience', desc: 'Design memory remembers your intent across sessions and alerts on drift.' },
+                    { icon: '💬', title: 'Talk / Write mode', desc: 'Toggle between conversational chat and file-focused code editing.' },
+                    { icon: '📋', title: 'Project Rules', desc: 'Set persistent instructions SUNy follows in every chat for a project.' },
+                    { icon: '🎭', title: 'Persona', desc: 'Give SUNy a custom role — e.g. "You are a security expert".' },
+                    { icon: '⚡', title: 'Auto-Verify', desc: 'SUNy runs tests and lint in a loop until all errors are resolved.' },
+                    { icon: '📁', title: '@file mentions', desc: 'Type @file:path in any message to reference a file directly.' },
+                    { icon: '🖥️', title: 'Dev Server', desc: 'Start your dev server from the sidebar and get a clickable URL.' },
+                    { icon: '🔗', title: 'Secure Bridge', desc: 'Sandboxed bridge connection for safe file operations.' },
+                    { icon: '🔎', title: 'Symbol Reader', desc: 'Inspect file structure without reading the whole file content.' },
+                    { icon: '🌐', title: 'URL Fetch', desc: 'SUNy can fetch web pages and docs on demand during tasks.' },
+                    { icon: '🔧', title: 'Auto-Correction', desc: 'Failed code is analyzed and fixed automatically.' },
+                    { icon: '🧩', title: 'Subtask Delegation', desc: 'Complex tasks are split into focused sub-tasks with dedicated agents.' },
                   ].map(f => (
                     <div key={f.title} style={{ display: 'flex', gap: 10 }}>
                       <span style={{ fontSize: 16, flexShrink: 0 }}>{f.icon}</span>
