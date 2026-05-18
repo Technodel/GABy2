@@ -34,6 +34,9 @@ import { runTests, runFailingTests, buildTestFixPrompt } from './test-runner';
 import { pickRandom } from './personality';
 import { narrateMessage } from './narrator';
 import {
+  selectStrategies, launchHypothesis, completeHypothesis,
+} from './hypothesis-engine';
+import {
   scoreAgentTurn, type TrainingScorerInput,
 } from './training-scorer';
 import {
@@ -340,6 +343,46 @@ export async function runAgentLoop(req: AgentLoopRequest): Promise<AgentLoopResu
   })();
 
   const effectiveTools = textFormat ? undefined : tools;
+
+  // ── Hypothesis Engine: Parallel strategy testing ────────────────────────
+  // For complex tasks with tools available, spawn 2-3 mini-agent runs
+  // with different strategies and pick the best result to guide the main loop.
+  if (bridgeConnected && projectPath && !talkMode && projectId && userMessage.length > 80 && modelEntries.length > 0) {
+    try {
+      const strategies = selectStrategies(userMessage);
+      if (strategies.length >= 2) {
+        const { generateText: gt } = await import('ai');
+        const primaryModel = modelEntries[0].model as LanguageModel;
+        const strategyPrompts: Record<string, string> = {
+          direct_edit: '\n\n<strategy>Use targeted edits to existing files. Make minimal, precise changes.</strategy>',
+          refactor_first: '\n\n<strategy>First refactor/clean up the relevant code, then implement the change.</strategy>',
+          test_first: '\n\n<strategy>Write tests first, then implement the feature to make them pass.</strategy>',
+          from_scratch: '\n\n<strategy>Create new files with a fresh implementation.</strategy>',
+          minimal_patch: '\n\n<strategy>Find the absolute smallest change that solves the problem.</strategy>',
+        };
+        const hypResults = await Promise.allSettled(strategies.map(async (strategy) => {
+          const hypId = launchHypothesis({ userId, projectId: projectId!, problem: userMessage.slice(0, 200), strategy });
+          const hypSys = `${fullSystem}${strategyPrompts[strategy] || ''}`;
+          const hypMsgs = [...rawMessages.slice(-4)];
+          const result = await gt({ model: primaryModel, system: hypSys, messages: hypMsgs, maxTokens: 800, abortSignal: signal });
+          const text = result.text?.trim() || '';
+          const score = text.length > 50 ? Math.min(100, Math.round(text.length / 15)) : 0;
+          completeHypothesis({ hypothesisId: hypId, resultSummary: text.slice(0, 500), changedFiles: [], score });
+          return { strategy, text, score };
+        }));
+        let bestScore = -1, bestText = '', bestStrategy = '';
+        for (const r of hypResults) {
+          if (r.status === 'fulfilled' && r.value.score > bestScore) { bestScore = r.value.score; bestText = r.value.text; bestStrategy = r.value.strategy; }
+        }
+        if (bestText && bestText.length > 100) {
+          const hypBlock = ['', '<hypothesis_testing>', `Best strategy: ${bestStrategy}`, `Result: ${bestText.slice(0, 1500)}`, '</hypothesis_testing>'].join('\n');
+          const ins = fullSystem.lastIndexOf('\n<WorkingDirectory>');
+          fullSystem = ins >= 0 ? fullSystem.slice(0, ins) + '\n' + hypBlock + fullSystem.slice(ins) : fullSystem + '\n' + hypBlock;
+          console.log(`[agent-loop] Hypothesis engine injected: ${bestStrategy} (score: ${bestScore})`);
+        }
+      }
+    } catch (e) { console.warn('[agent-loop] Hypothesis engine failed:', (e as Error).message); }
+  }
 
   // Notify client that streaming is starting
   // Emit stage event for pipeline phase tracking

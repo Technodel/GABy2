@@ -19,6 +19,7 @@ import { isBridgeConnected, registerPathForUser } from './bridge-manager';
 import { acquireLock, releaseLock, isLockedByOther } from './project-lock';
 import { isFeatureEnabled, getAllFeatureFlags } from './feature-flags';
 import { startTaskWorker } from './task-worker';
+import { startScheduler } from './scheduled-agents';
 import { hookSystem } from './hook-system';
 import { logOperation, logToolCall, getSessionLog } from './operation-audit';
 import { verifyToken } from './auth';
@@ -40,6 +41,7 @@ import { processDesignIntents, getDesignIntentsPrompt, initializeDesignIntentTab
 import { silentCodeReview, formatCodeReviewForPrompt, postMergeValidation, formatValidationForPrompt, analyzeInteractionPatterns, formatPatternAnalysisForPrompt, recordInteraction, initializeInteractionPatternsTable } from './verification-obsession';
 import { getPresenceInjection, updatePresenceProfile, getPresenceProfile, initializePresenceTable } from './presence-engineering';
 import { getSkillSystemPrompt, initSkillSystem } from './skill-loader';
+import { formatGoalContext } from './goal-tracker';
 
 const PORT = parseInt(process.env.SUNY_PORT || process.env.GABY_PORT || '3500', 10);
 const ALLOWED_ORIGIN = process.env.SUNY_ALLOWED_ORIGIN || process.env.GABY_ALLOWED_ORIGIN || 'http://localhost:5173';
@@ -1172,6 +1174,15 @@ function handleUserClientUpgrade(ws: WebSocket, req: http.IncomingMessage): void
         }
       }
 
+      // Inject goal tracker context (current goal, progress, success criteria)
+      if (projectPath && projectId && isFeatureEnabled('ff_goal_tracker')) {
+        const goalCtx = formatGoalContext(userId, projectId);
+        if (goalCtx) {
+          systemLines.push('', goalCtx);
+          console.log('[index] Goal tracker context injected');
+        }
+      }
+
       // ── Phase 5: Presence Engineering ──────────────────────────────
       // Injects conversation flow, error vulnerability, attention awareness,
       // and celebration cues into the system prompt.
@@ -1754,5 +1765,8 @@ server.listen(PORT, () => {
 
 // Start background task worker (Phase 4 — processes task_queue entries)
 startTaskWorker();
+
+// Start scheduled agents scheduler (Phase 4 — polls DB for due agents every 60s)
+try { startScheduler(); } catch (e) { console.warn('[scheduler] Failed to start:', (e as Error).message); }
 
 export default app;

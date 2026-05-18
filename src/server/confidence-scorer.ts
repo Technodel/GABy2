@@ -142,13 +142,13 @@ export function markEscalationResolved(
 export function getConfidenceStats(userId: number, projectId: number): ConfidenceStats {
   const db = getDb();
   const rows = db.prepare(`
-    SELECT confidence, escalation_needed, escalation_resolved
+    SELECT confidence, escalation_needed, escalation_resolved, uncertainties
     FROM confidence_log
     WHERE user_id = ? AND project_id = ?
     ORDER BY created_at DESC
     LIMIT 500
   `).all(userId, projectId) as Array<{
-    confidence: number; escalation_needed: number; escalation_resolved: number;
+    confidence: number; escalation_needed: number; escalation_resolved: number; uncertainties: string;
   }>;
 
   if (rows.length === 0) {
@@ -167,8 +167,19 @@ export function getConfidenceStats(userId: number, projectId: number): Confidenc
   // Get top uncertainty topics
   const uncertaintyMap = new Map<string, number>();
   for (const row of rows) {
-    // We can't easily parse uncertainties from aggregate, so this is best-effort
+    try {
+      const parsed = JSON.parse(row.uncertainties || '[]') as string[];
+      for (const topic of parsed) {
+        uncertaintyMap.set(topic, (uncertaintyMap.get(topic) || 0) + 1);
+      }
+    } catch {
+      // Skip rows with invalid JSON
+    }
   }
+  const topUncertainties = Array.from(uncertaintyMap.entries())
+    .map(([topic, count]) => ({ topic, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
 
   return {
     averageConfidence: Math.round(avgConf * 100) / 100,
@@ -176,7 +187,7 @@ export function getConfidenceStats(userId: number, projectId: number): Confidenc
     escalationRate: total > 0 ? Math.round((escalations / total) * 100) : 0,
     escalationSuccessRate: escalations > 0 ? Math.round((escalationsResolved / escalations) * 100) : 100,
     lowConfidenceCount: lowConf,
-    topUncertainties: [],
+    topUncertainties,
   };
 }
 
