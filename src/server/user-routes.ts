@@ -9,6 +9,7 @@ import { userClientManager } from './user-client-manager';
 import { loadProjectRules, saveProjectRules, deleteProjectRules } from './project-rules';
 import { listCheckpoints, rollbackToCheckpoint } from './git-manager';
 import { getBlueprintEntries } from './blueprint-memory';
+import { evaluate } from 'mathjs';
 
 const router = Router();
 router.use(requireAuth);
@@ -305,10 +306,38 @@ router.get('/contact', (_req: Request, res: Response) => {
 // ── Public pricing (for landing page, no auth required) ───────────────────────
 
 router.get('/pricing-public', (_req: Request, res: Response) => {
+
   const modes = getDb().prepare(
-    'SELECT mode, display_name, description, input_token_base_cost, output_token_base_cost FROM pricing_modes ORDER BY id'
-  ).all();
-  res.json(modes);
+    'SELECT mode, display_name, description, input_token_base_cost, output_token_base_cost, markup_formula, model_id FROM pricing_modes ORDER BY id'
+  ).all() as Array<{
+    mode: string; display_name: string; description: string;
+    input_token_base_cost: number; output_token_base_cost: number;
+    markup_formula: string; model_id: string;
+  }>;
+  const enriched = modes.map(m => {
+    // Compute display price per 1M tokens (input-only, output-only) with markup formula applied
+    let priceInput1M = m.input_token_base_cost * 1_000_000;
+    let priceOutput1M = m.output_token_base_cost * 1_000_000;
+    try {
+      priceInput1M = evaluate(m.markup_formula, {
+        cost: priceInput1M, input_tokens: 1_000_000, output_tokens: 0,
+        cache_write_tokens: 0, cache_read_tokens: 0,
+      }) as number;
+      priceOutput1M = evaluate(m.markup_formula, {
+        cost: priceOutput1M, input_tokens: 0, output_tokens: 1_000_000,
+        cache_write_tokens: 0, cache_read_tokens: 0,
+      }) as number;
+    } catch { /* fallback to base */ }
+    return {
+      mode: m.mode,
+      display_name: m.display_name,
+      description: m.description,
+      model_id: m.model_id,
+      input_price_per_1m: typeof priceInput1M === 'number' && !isNaN(priceInput1M) ? priceInput1M : m.input_token_base_cost * 1_000_000,
+      output_price_per_1m: typeof priceOutput1M === 'number' && !isNaN(priceOutput1M) ? priceOutput1M : m.output_token_base_cost * 1_000_000,
+    };
+  });
+  res.json(enriched);
 });
 
 // ── Balance check ──────────────────────────────────────────────────────────────

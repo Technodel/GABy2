@@ -9,6 +9,7 @@ import ContactUs from './pages/ContactUs';
 import AdminPanel from './pages/AdminPanel';
 import AdminUsers from './pages/AdminUsers';
 import AdminApiKeys from './pages/AdminApiKeys';
+import PricingPlans from './pages/PricingPlans';
 import AdminPricing from './pages/AdminPricing';
 import AdminUsageStats from './pages/AdminUsageStats';
 import AdminSettings from './pages/AdminSettings';
@@ -65,6 +66,8 @@ function AppRoutes() {
       <Route path="/login" element={auth === 'none' ? <Login onLogin={(role) => { setAuth(role as AuthState); navigate(role === 'admin' ? '/admin/users' : '/'); }} /> : <Navigate to={auth === 'admin' ? '/admin/users' : '/'} />} />
       <Route path="/about" element={<About />} />
       <Route path="/contact" element={<ContactUs />} />
+      <Route path="/pricing" element={<PricingPlans />} />
+      <Route path="/plans" element={<PricingPlans />} />
 
       {/* User routes */}
       <Route path="/" element={

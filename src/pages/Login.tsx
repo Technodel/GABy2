@@ -119,6 +119,11 @@ export default function Login({ onLogin }: LoginProps) {
           <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 20, lineHeight: 1.6 }}>
             No subscriptions. Pay only when GABy does real work.
           </p>
+          <div style={{ marginBottom: 14 }}>
+            <a href="/plans" style={{ fontSize: 12, color: 'var(--accent)', textDecoration: 'none', fontWeight: 500 }}>
+              View detailed plans & features →
+            </a>
+          </div>
           {pricing.length > 0 ? (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
               {pricing.map(m => (

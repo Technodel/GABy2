@@ -1,0 +1,158 @@
+import { Home, Eraser, BarChart2, HelpCircle, Settings, Phone, LogOut } from 'lucide-react';
+import BalanceBadge from './BalanceBadge';
+import BridgeStatusBadge from './BridgeStatusBadge';
+import ModeSelector from './ModeSelector';
+import type { Mode, Project, ProjectSpend } from '../pages/Chat';
+
+interface TopBarProps {
+  userData: { id: number; username: string; balance: number; wallet_balance: number; wallet_auto_spend: boolean; selected_mode: string; max_tokens_per_session?: number | null; cross_device_memory_enabled?: boolean; chat_show_technical_details?: boolean; bridge_connected: boolean; modes: Mode[] } | null;
+  activeProject: Project | null;
+  activeSpend: ProjectSpend | null;
+  balance: number;
+  walletBalance: number;
+  selectedMode: string;
+  modes: Mode[];
+  noBalance: boolean;
+  routingReason: string | null;
+  resolvedMode: string;
+  bridgeConnected: boolean;
+  sessLimit: number | null;
+  sessUsed: number;
+  messagesLength: number;
+  toggleSidebar: () => void;
+  changeMode: (mode: string) => void;
+  clearChat: () => void;
+  onOpenSettings: (section?: string, notice?: string) => void;
+  navigate: (path: string) => void;
+  handleLogout: () => void;
+  setShowBridgeTip: (v: boolean) => void;
+  setShowUsage: (v: boolean) => void;
+  loadUsageStats: (days: number) => void;
+  usageDays: number;
+  setShowHelp: (v: boolean) => void;
+}
+
+function routingIcon(mode: string): string {
+  const icons: Record<string, string> = {
+    'free': '💰', 'fast': '⚡', 'smart': '🚀', 'pro': '⭐',
+  };
+  return icons[mode] ?? '⚙️';
+}
+
+function formatSpend(cost: number): string {
+  if (cost >= 1) return `$${cost.toFixed(2)}`;
+  if (cost >= 0.01) return `$${cost.toFixed(4)}`;
+  return `$${cost.toFixed(6)}`;
+}
+
+export default function TopBar(props: TopBarProps) {
+  const {
+    userData, activeProject, activeSpend, balance, walletBalance,
+    selectedMode, modes, noBalance, routingReason, resolvedMode,
+    bridgeConnected, sessLimit, sessUsed, messagesLength,
+    toggleSidebar, changeMode, clearChat, onOpenSettings, navigate,
+    handleLogout, setShowBridgeTip, setShowUsage, loadUsageStats, usageDays, setShowHelp,
+  } = props;
+
+  return (
+    <div className="topbar" style={{
+      display: 'flex', alignItems: 'center', padding: '0 16px', height: 52,
+      borderBottom: '1px solid var(--border)', gap: 8, flexShrink: 0, position: 'relative',
+    }}>
+      {/* LEFT: brand + username + active project */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 }}>
+        <button
+          className="sidebar-toggle-btn"
+          onClick={toggleSidebar}
+          style={{
+            display: 'none', background: 'none', border: 'none', color: 'var(--text-secondary)',
+            cursor: 'pointer', padding: '4px', flexShrink: 0,
+          }}
+          title="Toggle sidebar"
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" />
+          </svg>
+        </button>
+        <img src="/SLOGO.png" alt="SUNy" style={{ width: 36, height: 36, borderRadius: '50%', objectFit: 'cover', flexShrink: 0 }} />
+        <span className="suny-logo" style={{ fontWeight: 700, fontSize: 16, color: 'var(--accent)', marginRight: 2 }}>SUNy</span>
+        <span className="topbar-tagline" style={{ fontSize: 11, color: 'var(--text-muted)', fontStyle: 'italic', opacity: 0.75, whiteSpace: 'nowrap' }}>Consider it done.</span>
+        {userData?.username && (
+          <span className="topbar-username" style={{
+            fontSize: 11, color: 'var(--text-secondary)', background: 'var(--surface)',
+            border: '1px solid var(--border)', borderRadius: 999, padding: '2px 8px',
+            whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 120,
+          }} title={userData.username}>
+            {userData.username}
+          </span>
+        )}
+        {activeProject && (
+          <span style={{ color: 'var(--text-secondary)', fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>· {activeProject.name}</span>
+        )}
+        {activeSpend && (
+          <span style={{ color: 'var(--text-muted)', fontSize: 11, whiteSpace: 'nowrap', display: 'none' }}>· {formatSpend(activeSpend.total_cost)}</span>
+        )}
+      </div>
+
+      {/* CENTER: Mode selector + routing badge */}
+      <div style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)', display: 'flex', alignItems: 'center', gap: 8, pointerEvents: 'auto' }}>
+        {modes.length > 0 && (
+          <ModeSelector modes={modes} selected={selectedMode} onChange={changeMode} noBalance={noBalance} />
+        )}
+        {routingReason && (
+          <div
+            style={{
+              display: 'flex', alignItems: 'center', gap: 5, padding: '3px 8px',
+              background: 'rgba(108,99,255,0.08)', border: '1px solid rgba(108,99,255,0.2)',
+              borderRadius: 6, fontSize: 11, color: 'var(--accent)', cursor: 'pointer',
+            }}
+            title={routingReason}
+          >
+            <span>{routingIcon(resolvedMode)}</span>
+            <span style={{ maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {routingReason}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* RIGHT: action buttons */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 1, justifyContent: 'flex-end' }}>
+        {activeProject && (
+          <button
+            className="btn btn-icon btn-secondary"
+            onClick={() => { clearChat(); }} title="Home — back to global chat"
+          >
+            <Home size={15} />
+          </button>
+        )}
+        {messagesLength > 0 && (
+          <button className="btn btn-icon btn-secondary" onClick={clearChat} title="Clear chat">
+            <Eraser size={15} />
+          </button>
+        )}
+        <BridgeStatusBadge connected={bridgeConnected} onClick={() => setShowBridgeTip(t => !t)} />
+        <BalanceBadge
+          balance={balance} walletBalance={walletBalance}
+          remainingTokens={sessLimit == null ? null : Math.max(0, sessLimit - sessUsed)}
+          onOpenWalletSettings={() => onOpenSettings('wallet', 'Opened Wallet Transfer in Settings')}
+        />
+        <button className="btn btn-icon btn-secondary" onClick={() => { setShowUsage(true); loadUsageStats(usageDays); }} title="Usage stats">
+          <BarChart2 size={15} />
+        </button>
+        <button className="btn btn-icon btn-secondary" onClick={() => setShowHelp(true)} title="Keyboard shortcuts & help">
+          <HelpCircle size={15} />
+        </button>
+        <button className="btn btn-icon btn-secondary" onClick={() => onOpenSettings()} title="Settings">
+          <Settings size={15} />
+        </button>
+        <button className="btn btn-icon btn-secondary" onClick={() => navigate('/contact')} title="Contact Us">
+          <Phone size={15} />
+        </button>
+        <button className="btn btn-icon btn-secondary" onClick={handleLogout} title="Sign out">
+          <LogOut size={15} />
+        </button>
+      </div>
+    </div>
+  );
+}
